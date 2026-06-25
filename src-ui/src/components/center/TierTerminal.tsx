@@ -369,7 +369,9 @@ function TierTerminalImpl({
       // behind the terminal — opaque background is the common case and pays
       // measurably less GPU time on Apple Silicon / integrated GPUs.
       allowTransparency: hasBg,
-      customGlyphs: true, // Pixel-perfect box-drawing on all platforms (canvas-drawn, font-independent)
+      // NOTE (6.1.0-beta test branch): `customGlyphs` option was removed upstream
+      // in 6.1 — custom box-drawing is now always-on by default, so the explicit
+      // opt-in is gone. Restore this line if we ever revert to 6.0.0.
       rescaleOverlappingGlyphs: true, // Force ambiguous-width chars (block chars ▀▄█) to single cell width
       // Cursor blink fires a GPU repaint every ~530ms for the entire app
       // lifetime. On laptops (especially Apple Silicon Air without a fan)
