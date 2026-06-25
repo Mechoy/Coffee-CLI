@@ -107,19 +107,42 @@ fn numstat_map(repo_root: &str, cached: bool) -> HashMap<String, (u32, u32)> {
 /// Absolute, forward-slashed key with an upper-cased Windows drive letter —
 /// the same normalization `compute_folder_stats` used, so the Explorer file
 /// tree keeps matching these paths against its `list_directory` entries.
-/// Current branch name. `rev-parse --abbrev-ref HEAD` returns the branch, or
-/// the literal "HEAD" when detached — in which case we surface the short SHA
-/// as "(abc1234)" so the panel header always has a label to show.
+/// Current branch name. `symbolic-ref --short HEAD` returns the branch even on
+/// an UNBORN branch (a fresh `git init` with no commits yet → "main"), which
+/// `rev-parse --abbrev-ref` does not (it yields the literal "HEAD" there).
+/// Falls through on a detached HEAD to the short SHA as "(abc1234)" so the
+/// header always has a label.
 fn git_branch(repo_root: &str) -> String {
-    let head = git_output(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .unwrap_or_default();
-    let head = head.trim();
-    if !head.is_empty() && head != "HEAD" {
-        return head.to_string();
+    if let Ok(s) = git_output(repo_root, &["symbolic-ref", "--short", "HEAD"]) {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
     }
     let sha = git_output(repo_root, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
     let sha = sha.trim();
     if sha.is_empty() { "HEAD".to_string() } else { format!("({sha})") }
+}
+
+/// Line count of a file, used as the "+N" for untracked files (which have no
+/// git blob to numstat). Text-only and size-capped; returns 0 on any failure
+/// or a binary/oversized file so it degrades to a blank badge, never a hang.
+const UNTRACKED_COUNT_CAP: usize = 200;
+const UNTRACKED_MAX_BYTES: u64 = 1_000_000;
+fn count_lines(path: &str) -> u32 {
+    let Ok(meta) = std::fs::metadata(path) else { return 0; };
+    if !meta.is_file() || meta.len() > UNTRACKED_MAX_BYTES {
+        return 0;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return 0; };
+    if bytes.is_empty() || bytes[..bytes.len().min(8192)].contains(&0u8) {
+        return 0; // empty or binary
+    }
+    let mut lines = bytes.iter().filter(|&&b| b == b'\n').count();
+    if *bytes.last().unwrap() != b'\n' {
+        lines += 1; // final line without a trailing newline still counts
+    }
+    lines.min(u32::MAX as usize) as u32
 }
 
 fn join_abs(repo_root: &str, rel: &str) -> String {
@@ -204,6 +227,16 @@ pub fn git_changes(folder: String) -> GitChanges {
                 added: a,
                 deleted: d,
             });
+        }
+    }
+
+    // Untracked files have no git blob to numstat; show their line count as
+    // additions so the badge/header aren't a meaningless "+0 -0". Bounded:
+    // skip when there are many untracked (a fresh repo can list thousands) and
+    // cap per-file size, keeping the polled call cheap.
+    if untracked.len() <= UNTRACKED_COUNT_CAP {
+        for e in untracked.iter_mut() {
+            e.added = count_lines(&e.path);
         }
     }
 

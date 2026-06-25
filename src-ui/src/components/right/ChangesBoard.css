@@ -163,6 +163,10 @@
   justify-content: space-between;
   gap: 8px;
   padding: 8px 14px;
+  /* Faint lift so this reads as the repo "bar" anchored at the top, with the
+   * Unstaged/Staged/Untracked group labels below it as lighter sub-headers —
+   * a clear two-level hierarchy instead of two competing header rows. */
+  background: rgba(255, 255, 255, 0.025);
   border-bottom: 1px solid var(--border, rgba(255,255,255,0.06));
   flex-shrink: 0;
 }
