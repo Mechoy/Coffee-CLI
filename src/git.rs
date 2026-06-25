@@ -82,20 +82,31 @@ pub enum GitChanges {
 }
 
 /// added/deleted counts keyed by repo-relative path, from a `numstat` stream.
-/// Binary files report "-\t-" → 0/0. Rename rows reformat the path field and
-/// won't match a plain rel path → that file degrades to a 0/0 badge (it still
-/// lists; only the count is missing). Counts are best-effort by design.
+///
+/// MUST use `-z`: without it git applies `core.quotepath` and octal-escapes
+/// non-ASCII paths (e.g. a CJK filename becomes `"\344\270\255…"`), which then
+/// never matches the RAW path we parse from `status --porcelain -z` — so every
+/// non-ASCII-named file would show a "+0 -0" badge. `-z` emits raw, NUL-
+/// separated records so the keys line up. Binary files report "-\t-" → 0/0;
+/// rename rows (path field empty under -z) simply don't match and degrade to a
+/// 0/0 badge. Counts are best-effort by design.
 fn numstat_map(repo_root: &str, cached: bool) -> HashMap<String, (u32, u32)> {
     let args: &[&str] = if cached {
-        &["diff", "--numstat", "--cached"]
+        &["diff", "--numstat", "-z", "--cached"]
     } else {
-        &["diff", "--numstat"]
+        &["diff", "--numstat", "-z"]
     };
     let mut map = HashMap::new();
     let Ok(out) = git_output(repo_root, args) else { return map; };
-    for line in out.lines() {
-        let mut it = line.splitn(3, '\t');
+    for field in out.split('\0') {
+        if field.is_empty() {
+            continue;
+        }
+        let mut it = field.splitn(3, '\t');
         let (Some(a), Some(d), Some(p)) = (it.next(), it.next(), it.next()) else { continue; };
+        if p.is_empty() {
+            continue; // rename record under -z carries the path in later fields
+        }
         map.insert(
             p.to_string(),
             (a.parse::<u32>().unwrap_or(0), d.parse::<u32>().unwrap_or(0)),
