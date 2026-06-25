@@ -55,6 +55,7 @@ export type GitChanges =
   | {
       state: 'ok';
       repo_root: string;
+      branch: string;
       staged: GitFileEntry[];
       unstaged: GitFileEntry[];
       untracked: GitFileEntry[];

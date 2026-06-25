@@ -156,6 +156,41 @@
 .changes-stats .diff-add { color: #4ec76b; }
 .changes-stats .diff-del { color: #e07070; }
 
+/* ── Branch header (top of the changes panel) ───────────────────────── */
+.changes-branch-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border, rgba(255,255,255,0.06));
+  flex-shrink: 0;
+}
+.changes-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-1);
+  font-size: 12px;
+  font-weight: 600;
+}
+.changes-branch svg { flex-shrink: 0; opacity: 0.8; }
+.changes-branch-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.changes-branch-stats {
+  display: inline-flex;
+  gap: 6px;
+  flex-shrink: 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.changes-branch-stats .diff-add { color: #4ec76b; }
+.changes-branch-stats .diff-del { color: #e07070; }
+
 /* ── Git group sections (Unstaged / Staged / Untracked) ─────────────── */
 .changes-group-header {
   display: flex;

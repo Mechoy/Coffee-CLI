@@ -70,8 +70,11 @@ pub enum GitChanges {
     NotRepo,
     Ok {
         /// Absolute, forward-slashed repository root. The frontend passes this
-        /// back to `git_file_diff` so diff pathspecs resolve from the top.
+        /// back to `git_show_file` so diff pathspecs resolve from the top.
         repo_root: String,
+        /// Current branch name, e.g. "main" / "feature/x". A detached HEAD
+        /// reports as "(<short-sha>)" so the header still shows something.
+        branch: String,
         staged: Vec<GitFileEntry>,
         unstaged: Vec<GitFileEntry>,
         untracked: Vec<GitFileEntry>,
@@ -104,6 +107,21 @@ fn numstat_map(repo_root: &str, cached: bool) -> HashMap<String, (u32, u32)> {
 /// Absolute, forward-slashed key with an upper-cased Windows drive letter —
 /// the same normalization `compute_folder_stats` used, so the Explorer file
 /// tree keeps matching these paths against its `list_directory` entries.
+/// Current branch name. `rev-parse --abbrev-ref HEAD` returns the branch, or
+/// the literal "HEAD" when detached — in which case we surface the short SHA
+/// as "(abc1234)" so the panel header always has a label to show.
+fn git_branch(repo_root: &str) -> String {
+    let head = git_output(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_default();
+    let head = head.trim();
+    if !head.is_empty() && head != "HEAD" {
+        return head.to_string();
+    }
+    let sha = git_output(repo_root, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+    let sha = sha.trim();
+    if sha.is_empty() { "HEAD".to_string() } else { format!("({sha})") }
+}
+
 fn join_abs(repo_root: &str, rel: &str) -> String {
     crate::server::normalize_path_key(&format!("{}/{}", repo_root.trim_end_matches('/'), rel))
 }
@@ -123,6 +141,7 @@ pub fn git_changes(folder: String) -> GitChanges {
         Err(_) => return GitChanges::NotRepo,
     };
 
+    let branch = git_branch(&repo_root);
     let staged_counts = numstat_map(&repo_root, true);
     let unstaged_counts = numstat_map(&repo_root, false);
 
@@ -188,7 +207,7 @@ pub fn git_changes(folder: String) -> GitChanges {
         }
     }
 
-    GitChanges::Ok { repo_root, staged, unstaged, untracked }
+    GitChanges::Ok { repo_root, branch, staged, unstaged, untracked }
 }
 
 /// Content of a file at a git revision, e.g. `git show HEAD:src/a.ts` or
