@@ -104,6 +104,7 @@ export const zhCN = {
   'settings.terminal.font.default': '默认(内置)',
   'settings.font.monospace': '等宽',
   'settings.font.other': '其他字体',
+  'settings.font.search': '搜索字体…',
   'settings.gambit': '妙手',
   'settings.send.title': '发送消息',
   'settings.send.newline': '换行',

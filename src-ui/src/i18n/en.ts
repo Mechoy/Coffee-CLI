@@ -106,6 +106,7 @@ export const en = {
   'settings.terminal.font.default': 'Default (bundled)',
   'settings.font.monospace': 'Monospace',
   'settings.font.other': 'Other fonts',
+  'settings.font.search': 'Search fonts…',
   'settings.gambit': 'Gambit',
   'settings.send.title': 'Send message',
   'settings.send.newline': 'for a new line',

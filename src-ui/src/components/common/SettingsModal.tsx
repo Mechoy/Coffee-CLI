@@ -18,6 +18,7 @@ import { useT } from '../../i18n/useT';
 import { IS_MACOS } from '../../lib/platform';
 import { TERM_COLOR_SCHEMES } from '../center/TierTerminal';
 import { commands, type FontInfo } from '../../tauri';
+import { FontPicker } from './FontPicker';
 import { THEME_COLORS, THEME_SHAPES, ICON_ART_THEMES, LANGUAGES, isMaskTintTheme } from '../../lib/personalization';
 import './SettingsModal.css';
 
@@ -303,28 +304,7 @@ export function SettingsModal() {
                 </div>
 
                 <div className="settings-section-label">{t('settings.terminal.font' as any) || '字体'}</div>
-                <select
-                  className="settings-font-select"
-                  value={state.termFont}
-                  onChange={(e) => setFont(e.target.value)}
-                >
-                  <option value="">{t('settings.terminal.font.default' as any) || '默认'}</option>
-                  {fonts === null && <option disabled>{t('diff.loading' as any) || '加载中…'}</option>}
-                  {fonts && fonts.some(f => f.monospace) && (
-                    <optgroup label={t('settings.font.monospace' as any) || '等宽'}>
-                      {fonts.filter(f => f.monospace).map(f => (
-                        <option key={f.family} value={f.family}>{f.family}</option>
-                      ))}
-                    </optgroup>
-                  )}
-                  {fonts && fonts.some(f => !f.monospace) && (
-                    <optgroup label={t('settings.font.other' as any) || '其他字体'}>
-                      {fonts.filter(f => !f.monospace).map(f => (
-                        <option key={f.family} value={f.family}>{f.family}</option>
-                      ))}
-                    </optgroup>
-                  )}
-                </select>
+                <FontPicker fonts={fonts} value={state.termFont} onChange={setFont} />
                 <div
                   className="settings-font-preview"
                   style={{ fontFamily: state.termFont ? `"${state.termFont}", monospace` : 'monospace' }}

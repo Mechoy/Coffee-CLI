@@ -104,6 +104,7 @@ export const zhTW = {
   'settings.terminal.font.default': '預設(內建)',
   'settings.font.monospace': '等寬',
   'settings.font.other': '其他字型',
+  'settings.font.search': '搜尋字型…',
   'settings.gambit': '妙手',
   'settings.send.title': '發送訊息',
   'settings.send.newline': '換行',
