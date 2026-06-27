@@ -2,6 +2,7 @@ export const zhCN = {
   'app.title': 'Coffee CLI',
   'explorer.tab.workspace': '工作区',
   'explorer.tab.history': '会话记录',
+  'account.login': '登录',
   'explorer.workspace.select-dir': '点击选择工作目录',
 
   // Context Menu

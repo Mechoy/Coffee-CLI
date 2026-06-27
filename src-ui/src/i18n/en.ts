@@ -3,6 +3,8 @@ export const en = {
   // Explorer
   'explorer.tab.workspace': 'Workspace',
   'explorer.tab.history': 'Sessions',
+  // Account / login (feat/account)
+  'account.login': 'Sign in',
   'explorer.workspace.select-dir': 'Click to select working directory',
 
   // Context Menu

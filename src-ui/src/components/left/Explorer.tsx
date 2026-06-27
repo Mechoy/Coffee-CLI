@@ -13,6 +13,7 @@ import { useFileStats, useDirtyDirs } from '../../lib/git-status';
 import { commands, onSelfUpdateProgress } from '../../tauri';
 import type { DirEntryInfo } from '../../tauri';
 import { HistoryBoard } from '../right/HistoryBoard';
+import { AccountFooter } from './AccountFooter';
 import './Explorer.css';
 
 // Snapshot lifecycle and the `+N -M` map live in lib/file-stats.tsx so the
@@ -927,7 +928,10 @@ export function Explorer() {
         )}
       </div>
 
-
+      {/* Account / login — bottom-left, below workspace + history. First
+          stone of the login version (feat/account); auth flow attaches
+          inside AccountFooter once the backend is decided. */}
+      <AccountFooter />
 
       {/* Right-click context menu */}
       {ctxMenu && <ContextMenu menu={ctxMenu} onClose={closeCtxMenu} />}
