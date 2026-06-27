@@ -50,6 +50,23 @@ export function FontPicker({ fonts, value, onChange }: FontPickerProps) {
     }
   }, [open]);
 
+  // Keep the portaled menu glued to the trigger if the modal body scrolls or
+  // the window resizes while open (the menu is fixed-positioned). Capture
+  // phase so it catches the scrolling settings body, not just window scroll.
+  useEffect(() => {
+    if (!open) return;
+    const reposition = () => {
+      const r = triggerRef.current?.getBoundingClientRect();
+      if (r) setPos({ left: r.left, top: r.bottom + 4, width: r.width });
+    };
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition);
+    return () => {
+      window.removeEventListener('scroll', reposition, true);
+      window.removeEventListener('resize', reposition);
+    };
+  }, [open]);
+
   const { mono, other } = useMemo(() => {
     const list = fonts || [];
     const q = query.trim().toLowerCase();

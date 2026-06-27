@@ -45,6 +45,11 @@ fn font_dirs() -> Vec<PathBuf> {
             dirs.push(h.join(".fonts"));
             dirs.push(h.join(".local").join("share").join("fonts"));
         }
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.is_empty() {
+                dirs.push(PathBuf::from(xdg).join("fonts"));
+            }
+        }
     }
     dirs
 }
@@ -60,8 +65,13 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u8) {
     };
     for entry in rd.flatten() {
         let p = entry.path();
+        // Skip symlinked dirs — avoids loops and walking into huge unrelated
+        // trees if a font dir is symlinked somewhere big.
+        let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
         if p.is_dir() {
-            collect_files(&p, out, depth + 1);
+            if !is_symlink {
+                collect_files(&p, out, depth + 1);
+            }
         } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
             let ext = ext.to_ascii_lowercase();
             if matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "otc") {
@@ -106,11 +116,24 @@ pub fn list_fonts() -> Vec<FontInfo> {
     // family -> monospace (OR across all faces of the family).
     let mut map: BTreeMap<String, bool> = BTreeMap::new();
     for f in files {
+        // Skip absurdly large files (corrupt / mislabeled) before reading them
+        // fully into memory.
+        if std::fs::metadata(&f)
+            .map(|m| m.len() > 64 * 1024 * 1024)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let Ok(data) = std::fs::read(&f) else { continue };
         let count = ttf_parser::fonts_in_collection(&data).unwrap_or(1);
         for i in 0..count {
             let Ok(face) = ttf_parser::Face::parse(&data, i) else { continue };
             if let Some(name) = family_name(&face) {
+                // Skip hidden/system faces: '.'-prefixed (e.g. macOS ".SF NS")
+                // and '@'-prefixed (Windows vertical-writing CJK aliases).
+                if name.starts_with('.') || name.starts_with('@') {
+                    continue;
+                }
                 let mono = face.is_monospaced();
                 let e = map.entry(name).or_insert(false);
                 *e = *e || mono;
@@ -132,6 +155,8 @@ pub fn list_fonts() -> Vec<FontInfo> {
 }
 
 #[tauri::command]
-pub fn list_system_fonts() -> Vec<FontInfo> {
-    list_fonts()
+pub async fn list_system_fonts() -> Vec<FontInfo> {
+    // The scan reads + parses hundreds of font files — run it off the IPC
+    // thread so opening Settings never freezes the UI.
+    tokio::task::spawn_blocking(list_fonts).await.unwrap_or_default()
 }

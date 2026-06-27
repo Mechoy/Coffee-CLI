@@ -928,8 +928,14 @@ function TierTerminalImpl({
     const term = xtermRef.current;
     if (!term) return;
     term.options.fontFamily = buildFontFamily(termFont);
-    // Glyph metrics changed → refit so rows/cols + the PTY size stay correct.
-    try { fitRef.current?.fit(); } catch {}
+    // Glyph metrics changed → refit, but ONLY when visible. termFont is global,
+    // so this effect fires in every tab incl. hidden (display:none) ones, where
+    // fit() would read ~0 size and collapse the grid to ~1 col. The activation
+    // path re-fits with the new font when a hidden tab is shown again.
+    const el = termRef.current;
+    if (el && el.clientWidth > 10 && el.clientHeight > 10) {
+      try { fitRef.current?.fit(); } catch {}
+    }
   }, [termFont]);
 
   // ── IME focus-scroll guard ───────────────────────────────────────────────

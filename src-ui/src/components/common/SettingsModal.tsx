@@ -132,8 +132,11 @@ export function SettingsModal() {
     dispatch({ type: 'SET_TERM_SCHEME', scheme: id });
   };
   const setFont = (family: string) => {
-    try { family ? localStorage.setItem('cc-term-font', family) : localStorage.removeItem('cc-term-font'); } catch {}
-    dispatch({ type: 'SET_TERM_FONT', font: family });
+    // Strip quotes/backslashes — the value is interpolated into a CSS
+    // fontFamily string, so don't let a stray quote break out of it.
+    const clean = family.replace(/["\\]/g, '');
+    try { clean ? localStorage.setItem('cc-term-font', clean) : localStorage.removeItem('cc-term-font'); } catch {}
+    dispatch({ type: 'SET_TERM_FONT', font: clean });
   };
   const setOpacity = (n: number) => dispatch({ type: 'SET_WALLPAPER_OPACITY', opacity: n });
   const setEnterToSend = (value: boolean) => {
