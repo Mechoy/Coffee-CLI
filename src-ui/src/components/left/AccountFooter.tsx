@@ -7,7 +7,8 @@
 // replace it later. The remote tool list / icons will come from the remote
 // machine's own Coffee CLI detection × our bundled icons (see project notes).
 
-import { useState } from 'react';
+import { useState, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { useT } from '../../i18n/useT';
 import './AccountFooter.css';
 
@@ -87,6 +88,10 @@ export function AccountFooter() {
   // DEMO: starts logged-out; clicking 登录 fake-logs-in. Real auth replaces this.
   const [account, setAccount] = useState<Account | null>(null);
   const [open, setOpen] = useState(false);
+  // Fixed-position anchor for the portaled menu (so it escapes the left
+  // panel's overflow clipping — same approach as the ctx-menu).
+  const [pos, setPos] = useState<{ left: number; bottom: number; width: number } | null>(null);
+  const footerRef = useRef<HTMLDivElement>(null);
 
   const handleFooterClick = () => {
     if (!account) {
@@ -94,7 +99,15 @@ export function AccountFooter() {
       setAccount(DEMO_ACCOUNT);
       return;
     }
-    setOpen((v) => !v);
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    const r = footerRef.current?.getBoundingClientRect();
+    if (r) {
+      setPos({ left: r.left + 4, bottom: window.innerHeight - r.top + 6, width: r.width - 8 });
+    }
+    setOpen(true);
   };
 
   const handleLogout = () => {
@@ -108,11 +121,15 @@ export function AccountFooter() {
   };
 
   return (
-    <div className="account-footer">
-      {open && account && (
+    <div className="account-footer" ref={footerRef}>
+      {open && account && pos && createPortal(
         <>
           <div className="account-backdrop" onClick={() => setOpen(false)} />
-          <div className="host-menu" role="menu">
+          <div
+            className="host-menu"
+            role="menu"
+            style={{ position: 'fixed', left: pos.left, bottom: pos.bottom, width: pos.width }}
+          >
             {DEMO_HOSTS.map((host) => {
               const canExpand = host.online && !host.current && !!host.tools?.length;
               return (
@@ -152,7 +169,8 @@ export function AccountFooter() {
               退出登录
             </button>
           </div>
-        </>
+        </>,
+        document.body
       )}
 
       <button className={`account-row${open ? ' is-open' : ''}`} onClick={handleFooterClick}>

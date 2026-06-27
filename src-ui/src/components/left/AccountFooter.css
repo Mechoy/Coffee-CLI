@@ -1,5 +1,6 @@
 /* AccountFooter — bottom-left account/login entry + remote-host menu.
-   Pinned to the bottom of the left panel's flex column. (feat/account demo) */
+   Pinned to the bottom of the left panel's flex column. (feat/account demo)
+   Theming follows the same vars as .ctx-menu so it tracks every theme. */
 
 .account-footer {
   position: relative;
@@ -19,7 +20,8 @@
   border: none;
   background: transparent;
   border-radius: var(--radius-md);
-  color: var(--text-primary);
+  color: var(--text-1);
+  font-family: var(--font);
   font-size: 13px;
   text-align: left;
   cursor: pointer;
@@ -27,7 +29,7 @@
 }
 .account-row:hover,
 .account-row.is-open {
-  background: var(--hover-bg, rgba(255, 255, 255, 0.06));
+  background: var(--bg-hover);
 }
 
 .account-avatar {
@@ -39,12 +41,12 @@
   flex-shrink: 0;
   border-radius: 50%;
   overflow: hidden;
-  background: var(--surface, rgba(255, 255, 255, 0.06));
-  color: var(--text-secondary);
+  background: var(--bg-hover);
+  color: var(--text-2);
 }
 .account-avatar.logged {
   background: var(--accent);
-  color: #241a10;
+  color: #fff;
   font-weight: 700;
   font-size: 13px;
 }
@@ -63,7 +65,7 @@
 .account-id small {
   display: block;
   font-size: 10.5px;
-  color: var(--text-secondary);
+  color: var(--text-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -72,28 +74,28 @@
   width: 15px;
   height: 15px;
   flex-shrink: 0;
-  color: var(--text-secondary);
+  color: var(--text-2);
 }
 
-/* ── Click-outside backdrop ── */
+/* ── Click-outside backdrop (portaled to body) ── */
 .account-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 40;
+  z-index: 9998;
 }
 
-/* ── Host menu (opens upward, above the footer) ── */
+/* ── Host menu (portaled, fixed-positioned above the footer) ── */
 .host-menu {
-  position: absolute;
-  left: 6px;
-  right: 6px;
-  bottom: calc(100% - 2px);
-  z-index: 50;
+  z-index: 9999;
   padding: 4px;
-  background: var(--menu-bg, #262220);
+  /* Opaque theming trick from .ctx-menu: --bg-app underneath + --bg-panel on
+     top so the menu is solid in Light theme (where --bg-panel is translucent)
+     and tracks every theme's palette. */
+  background-color: var(--bg-app);
+  background-image: linear-gradient(var(--bg-panel), var(--bg-panel));
   border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
+  border-radius: var(--radius-md);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 8px 28px rgba(0, 0, 0, 0.32);
 }
 
 .host-item {
@@ -104,16 +106,15 @@
   align-items: center;
   gap: 9px;
   padding: 9px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   font-size: 12.5px;
-  color: var(--text-primary);
+  color: var(--text-1);
 }
 .host-item.expandable > .host-row {
   cursor: pointer;
 }
 .host-item.expandable:hover > .host-row {
-  background: rgba(217, 138, 61, 0.17);
-  outline: 1px solid rgba(217, 138, 61, 0.4);
+  background: var(--bg-hover);
 }
 .host-row.offline {
   opacity: 0.45;
@@ -122,6 +123,7 @@
   width: 17px;
   height: 17px;
   flex-shrink: 0;
+  color: var(--text-1);
 }
 .host-addr {
   flex: 1;
@@ -134,34 +136,37 @@
   flex-shrink: 0;
 }
 .host-dot.on {
-  background: var(--accent-green, #46b06a);
+  background: #46b06a;
   box-shadow: 0 0 6px rgba(70, 176, 106, 0.7);
 }
 .host-dot.off {
-  background: var(--text-secondary);
+  background: var(--text-2);
 }
 .host-status {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: var(--text-2);
 }
 .host-item.expandable:hover .host-status {
-  color: var(--accent-green, #46b06a);
+  color: #46b06a;
 }
 .host-chev {
   width: 14px;
   height: 14px;
   flex-shrink: 0;
+  color: var(--text-2);
+}
+.host-item.expandable:hover .host-chev {
   color: var(--accent);
 }
 .host-badge {
   font-size: 10px;
   padding: 1px 7px;
   border-radius: 999px;
-  background: var(--surface, rgba(255, 255, 255, 0.06));
-  color: var(--text-secondary);
+  background: var(--bg-hover);
+  color: var(--text-2);
 }
 
-/* ── Secondary submenu (tools on a host) — flies out to the right on hover ── */
+/* ── Secondary submenu (tools on a host) — flies right on hover ── */
 .host-submenu {
   display: none;
   position: absolute;
@@ -169,10 +174,11 @@
   top: -4px;
   width: 176px;
   padding: 4px;
-  background: var(--menu-bg, #262220);
+  background-color: var(--bg-app);
+  background-image: linear-gradient(var(--bg-panel), var(--bg-panel));
   border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
+  border-radius: var(--radius-md);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 8px 28px rgba(0, 0, 0, 0.32);
 }
 .host-item.expandable:hover .host-submenu {
   display: block;
@@ -185,15 +191,16 @@
   padding: 9px 10px;
   border: none;
   background: transparent;
-  border-radius: 8px;
-  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  color: var(--text-1);
+  font-family: var(--font);
   font-size: 12.5px;
   text-align: left;
   cursor: pointer;
 }
 .tool-item:hover,
 .tool-item.first {
-  background: rgba(217, 138, 61, 0.16);
+  background: var(--bg-hover);
 }
 .tool-item .ti-ic {
   width: 18px;
@@ -219,38 +226,18 @@
   padding: 9px;
   border: none;
   background: transparent;
-  border-radius: 8px;
-  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-family: var(--font);
   font-size: 12.5px;
   text-align: left;
   cursor: pointer;
 }
 .host-logout:hover {
-  background: var(--hover-bg, rgba(255, 255, 255, 0.05));
+  background: var(--bg-hover);
+  color: var(--text-1);
 }
 .host-logout svg {
   width: 15px;
   height: 15px;
-}
-
-/* Glass theme nukes bg/border/shadow (incl :hover) on panel divs via a
-   :not() chain in global.css — opt back in so the footer + menus stay
-   visible and the hover affordances work. See: glass shape nuclear rule. */
-[data-shape="glass"] .account-footer {
-  border-top: 1px solid var(--border) !important;
-}
-[data-shape="glass"] .account-row:hover,
-[data-shape="glass"] .account-row.is-open {
-  background: rgba(255, 255, 255, 0.08) !important;
-}
-[data-shape="glass"] .host-menu,
-[data-shape="glass"] .host-submenu {
-  background: #262220 !important;
-  border: 1px solid var(--border) !important;
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55) !important;
-}
-[data-shape="glass"] .host-item.expandable:hover > .host-row,
-[data-shape="glass"] .tool-item:hover,
-[data-shape="glass"] .tool-item.first {
-  background: rgba(217, 138, 61, 0.2) !important;
 }
