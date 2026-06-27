@@ -678,8 +678,8 @@ export function TaskBoard() {
                             title's available width is IDENTICAL across modes
                             (edit = single ✓, normal = [delete][send]). Without
                             the reserved box the title shifts horizontally when
-                            entering/leaving edit. Icons are right-aligned, so
-                            the ✓ lands where the play button sits. */}
+                            entering/leaving edit. The lone ✓ is centered in the
+                            reserved space (see .task-actions). */}
                         <div className="task-actions">
                           {isEditingThis ? (
                             <button

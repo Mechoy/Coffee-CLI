@@ -441,15 +441,16 @@
 }
 
 /* ─── Right-side action cluster ────────────────────────────────────────────── */
-/* Fixed-width box reserving the WIDEST mode (two 18px slots + 4px gap = 40px),
-   right-aligned. Edit mode shows a single ✓ that lands flush-right where the
-   play button sits; normal mode shows [delete][send]. Because the box width
-   never changes, the title's flex space is identical across modes — no
-   horizontal text jitter when entering/leaving edit. */
+/* Fixed-width box reserving the WIDEST mode (two 18px slots + 4px gap = 40px).
+   Because the box width never changes, the title's flex space is identical
+   across modes — no horizontal text jitter when entering/leaving edit.
+   Centered: normal mode's two icons fill the 40px exactly (so centering is a
+   no-op there), while edit mode's single ✓ sits centered in the reserved
+   space rather than pinned flush-right. */
 .task-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: center;
   gap: 4px;
   width: 40px;
   flex-shrink: 0;
