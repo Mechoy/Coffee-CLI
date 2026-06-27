@@ -170,7 +170,7 @@
 .host-submenu {
   display: none;
   position: absolute;
-  left: calc(100% + 6px);
+  left: calc(100% + 7px);
   top: -4px;
   width: 176px;
   padding: 4px;
