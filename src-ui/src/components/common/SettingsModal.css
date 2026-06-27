@@ -344,3 +344,29 @@
 .settings-lang-label { flex: 1; }
 .settings-lang-check { display: flex; color: var(--accent, #c4956a); }
 .settings-lang-check svg { width: 14px; height: 14px; }
+
+/* ── Terminal font picker ──────────────────────────────────────────────── */
+.settings-font-select {
+  width: 100%;
+  padding: 9px 11px;
+  font-family: var(--font, system-ui);
+  font-size: 13px;
+  color: var(--text-1, #fff);
+  background: var(--bg-hover, rgba(255, 255, 255, 0.05));
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+  border-radius: var(--radius-sm, 10px);
+  cursor: pointer;
+}
+.settings-font-select:focus {
+  outline: none;
+  border-color: var(--accent, #c4956a);
+}
+.settings-font-preview {
+  margin-top: 10px;
+  padding: 12px 14px;
+  font-size: 14px;
+  color: var(--text-2, rgba(255, 255, 255, 0.75));
+  background: var(--bg-app, #1b1917);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: var(--radius-sm, 10px);
+}

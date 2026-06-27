@@ -17,6 +17,7 @@ import { useAppState, useAppDispatch, type ThemeColor, type ThemeShape, type Ico
 import { useT } from '../../i18n/useT';
 import { IS_MACOS } from '../../lib/platform';
 import { TERM_COLOR_SCHEMES } from '../center/TierTerminal';
+import { commands, type FontInfo } from '../../tauri';
 import { THEME_COLORS, THEME_SHAPES, ICON_ART_THEMES, LANGUAGES, isMaskTintTheme } from '../../lib/personalization';
 import './SettingsModal.css';
 
@@ -59,6 +60,9 @@ export function SettingsModal() {
   const t = useT();
   const [section, setSection] = useState<Section>('appearance');
   const [version, setVersion] = useState('');
+  // Installed fonts for the terminal font picker — loaded lazily (Rust scan)
+  // the first time the Terminal section is opened. null = not loaded yet.
+  const [fonts, setFonts] = useState<FontInfo[] | null>(null);
 
   const open = state.settingsOpen;
   const close = () => dispatch({ type: 'SET_SETTINGS_OPEN', open: false });
@@ -81,6 +85,12 @@ export function SettingsModal() {
     return () => document.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  // Lazy-load the system font list when the Terminal section is first shown.
+  useEffect(() => {
+    if (!open || section !== 'terminal' || fonts !== null) return;
+    commands.listSystemFonts().then(setFonts).catch(() => setFonts([]));
+  }, [open, section, fonts]);
 
   if (!open) return null;
 
@@ -119,6 +129,10 @@ export function SettingsModal() {
   const setScheme = (id: string) => {
     try { id ? localStorage.setItem('cc-term-scheme', id) : localStorage.removeItem('cc-term-scheme'); } catch {}
     dispatch({ type: 'SET_TERM_SCHEME', scheme: id });
+  };
+  const setFont = (family: string) => {
+    try { family ? localStorage.setItem('cc-term-font', family) : localStorage.removeItem('cc-term-font'); } catch {}
+    dispatch({ type: 'SET_TERM_FONT', font: family });
   };
   const setOpacity = (n: number) => dispatch({ type: 'SET_WALLPAPER_OPACITY', opacity: n });
   const setEnterToSend = (value: boolean) => {
@@ -286,6 +300,36 @@ export function SettingsModal() {
                       Aa
                     </button>
                   ))}
+                </div>
+
+                <div className="settings-section-label">{t('settings.terminal.font' as any) || '字体'}</div>
+                <select
+                  className="settings-font-select"
+                  value={state.termFont}
+                  onChange={(e) => setFont(e.target.value)}
+                >
+                  <option value="">{t('settings.terminal.font.default' as any) || '默认'}</option>
+                  {fonts === null && <option disabled>{t('diff.loading' as any) || '加载中…'}</option>}
+                  {fonts && fonts.some(f => f.monospace) && (
+                    <optgroup label={t('settings.font.monospace' as any) || '等宽'}>
+                      {fonts.filter(f => f.monospace).map(f => (
+                        <option key={f.family} value={f.family}>{f.family}</option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {fonts && fonts.some(f => !f.monospace) && (
+                    <optgroup label={t('settings.font.other' as any) || '其他字体'}>
+                      {fonts.filter(f => !f.monospace).map(f => (
+                        <option key={f.family} value={f.family}>{f.family}</option>
+                      ))}
+                    </optgroup>
+                  )}
+                </select>
+                <div
+                  className="settings-font-preview"
+                  style={{ fontFamily: state.termFont ? `"${state.termFont}", monospace` : 'monospace' }}
+                >
+                  Coffee CLI · 终端字体预览 AaBb 123 {'{ }'} =&gt;
                 </div>
               </>
             )}
