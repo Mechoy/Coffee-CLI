@@ -125,30 +125,39 @@ fn main() -> Result<()> {
     //      toggle worked in Terminal.app (login shell) but not here.
     //
     // Fix: ask the user's login shell for its full environment ONCE at
-    // startup via a single `-ilc env` probe. PATH replaces the process
-    // PATH (with a sanity guard); every other variable is imported ONLY
-    // when absent from our process env — the launchd/GUI env always wins,
-    // we just fill gaps. PTY spawns inherit the process env (see the
-    // `std::env::vars()` loop in terminal.rs), so one probe here fixes
-    // every downstream tab and tool-detection `which`.
+    // startup via a single `-ilc` probe. The probe prints a sentinel
+    // marker line, then `env`; rc-file echo (motd banners, `echo` in
+    // .zshrc) lands BEFORE the marker and is discarded, so only the clean
+    // `env` output is parsed. PATH replaces the process PATH (with a
+    // sanity guard); every other variable is imported ONLY when absent
+    // from our process env — the launchd/GUI env always wins, we just fill
+    // gaps. PTY spawns inherit the process env (see the `std::env::vars()`
+    // loop in terminal.rs), so one probe here fixes every downstream tab
+    // and tool-detection `which`.
     //
     // We use `-ilc` (interactive + login) so both .zprofile/.bash_profile
     // AND .zshrc/.bashrc are sourced — matches what the user sees when
     // they open a fresh terminal window. `env` is an external command, so
     // fish works too (its exported PATH arrives colon-joined, no special
-    // casing needed).
+    // casing).
     #[cfg(not(target_os = "windows"))]
     unsafe {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        // Sentinel-delimited `env` so rc-file echo (motd banners, `echo`
+        // in .zshrc) that lands AFTER the marker doesn't get folded into a
+        // previous variable's value. The marker is printed first, then the
+        // real `env` output; parse_env_dump slices at the marker.
+        let probe = format!("printf '{}\\n'; env", ENV_DUMP_MARKER);
         if let Ok(out) = std::process::Command::new(&shell)
-            .args(["-ilc", "env"])
+            .args(["-ilc", &probe])
             .output()
         {
             if out.status.success() {
+                let dump = String::from_utf8_lossy(&out.stdout);
                 // Shell bookkeeping vars that must NOT be imported into a
                 // GUI process context (PATH is handled with its own guard).
                 const SKIP: &[&str] = &["PATH", "PWD", "OLDPWD", "SHLVL", "_"];
-                for (name, value) in parse_env_dump(&String::from_utf8_lossy(&out.stdout)) {
+                for (name, value) in parse_env_dump(&dump) {
                     if name == "PATH" {
                         // Sanity guard: a real PATH always contains ':'. If
                         // the shell rc errored out and we got garbage /
@@ -214,21 +223,37 @@ fn main() -> Result<()> {
     server::start_ui(pending_launch)
 }
 
-/// Parse `env` command output into (name, value) pairs for the login-shell
-/// environment inheritance probe in `main()`.
-///
-/// `env` prints one `NAME=value` per line, but two real-world wrinkles:
-///   - Interactive rc files sometimes echo junk to stdout (greeting
-///     banners, `echo` in .zshrc). Those lines are ignored until the first
-///     valid entry appears.
-///   - Values can contain newlines (multiline exports). A line that does
-///     NOT start a new entry is treated as a continuation of the previous
-///     variable's value.
-///
-/// An entry line must match `^[A-Za-z_][A-Za-z0-9_]*=`. Split at the first
-/// '=' — values may themselves contain '=' (base64 blobs, `a=b` pairs).
+/// Sentinel printed by the login-shell probe before `env` output. The probe
+/// is `printf 'MARKER\n'; env`. rc-file echo that lands BEFORE the marker is
+/// irrelevant; echo AFTER the marker can't be told apart from a multiline
+/// value, so we keep the LAST marker and parse only what follows it.
 #[cfg(not(target_os = "windows"))]
-fn parse_env_dump(dump: &str) -> Vec<(String, String)> {
+const ENV_DUMP_MARKER: &str = "__COFFEE_ENV_DUMP_MARKER__";
+
+/// Parse raw probe stdout into (name, value) pairs.
+///
+/// The probe prints `ENV_DUMP_MARKER` then `env`. We slice from the LAST
+/// marker so trailing rc echo can't extend the final variable's value
+/// (the leading-echo case is handled by `is_entry_start` rejecting non-entry
+/// lines before the first valid entry). If the marker is absent (shell
+/// without `printf`), we fall back to parsing the whole dump.
+#[cfg(not(target_os = "windows"))]
+fn parse_env_dump(raw: &str) -> Vec<(String, String)> {
+    let env_only = match raw.rfind(ENV_DUMP_MARKER) {
+        Some(idx) => &raw[idx + ENV_DUMP_MARKER.len()..],
+        None => raw,
+    };
+    parse_env_lines(env_only)
+}
+
+/// Parse marker-sliced `env` output into (name, value) pairs.
+///
+/// An entry line must match `^[A-Za-z_][A-Za-z0-9_]*=`; a line that does
+/// NOT start a new entry is treated as a continuation of the previous
+/// variable's value (multiline exports). Split at the first '=' so values
+/// may themselves contain '=' (base64 blobs, `a=b` pairs).
+#[cfg(not(target_os = "windows"))]
+fn parse_env_lines(env_only: &str) -> Vec<(String, String)> {
     fn is_entry_start(line: &str) -> bool {
         let bytes = line.as_bytes();
         if bytes.is_empty() {
@@ -246,7 +271,7 @@ fn parse_env_dump(dump: &str) -> Vec<(String, String)> {
     }
 
     let mut out: Vec<(String, String)> = Vec::new();
-    for line in dump.lines() {
+    for line in env_only.lines() {
         if is_entry_start(line) {
             let eq = line.find('=').unwrap();
             out.push((line[..eq].to_string(), line[eq + 1..].to_string()));
@@ -260,14 +285,13 @@ fn parse_env_dump(dump: &str) -> Vec<(String, String)> {
 
 #[cfg(all(test, not(target_os = "windows")))]
 mod env_parse_tests {
-    use super::parse_env_dump;
+    use super::{parse_env_dump, parse_env_lines, ENV_DUMP_MARKER};
 
     #[test]
     fn parses_simple_entries() {
-        let dump = "PATH=/usr/bin:/bin\nKIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL=1\nHOME=/Users/x\n";
-        let vars = parse_env_dump(dump);
+        let dump = format!("{}\nPATH=/usr/bin:/bin\nKIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL=1\nHOME=/Users/x\n", ENV_DUMP_MARKER);
         assert_eq!(
-            vars,
+            parse_env_dump(&dump),
             vec![
                 ("PATH".to_string(), "/usr/bin:/bin".to_string()),
                 ("KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL".to_string(), "1".to_string()),
@@ -278,18 +302,19 @@ mod env_parse_tests {
 
     #[test]
     fn value_may_contain_equals_sign() {
-        let dump = "TOKEN=abc=def==\n";
+        let dump = format!("{}\nTOKEN=abc=def==\n", ENV_DUMP_MARKER);
         assert_eq!(
-            parse_env_dump(dump),
+            parse_env_dump(&dump),
             vec![("TOKEN".to_string(), "abc=def==".to_string())]
         );
     }
 
     #[test]
     fn rc_echo_junk_before_first_entry_is_ignored() {
-        let dump = "Welcome to my shell!\n\x1b[36mhello\x1b[0m\nFOO=bar\n";
+        // Pre-marker junk: parse_env_dump slices past the last marker.
+        let dump = format!("Welcome to my shell!\n{}\nFOO=bar\n", ENV_DUMP_MARKER);
         assert_eq!(
-            parse_env_dump(dump),
+            parse_env_dump(&dump),
             vec![("FOO".to_string(), "bar".to_string())]
         );
     }
@@ -298,7 +323,7 @@ mod env_parse_tests {
     fn non_entry_lines_extend_multiline_values() {
         let dump = "MULTI=line1\nline2\nline3\nNEXT=ok\n";
         assert_eq!(
-            parse_env_dump(dump),
+            parse_env_lines(dump),
             vec![
                 ("MULTI".to_string(), "line1\nline2\nline3".to_string()),
                 ("NEXT".to_string(), "ok".to_string()),
@@ -313,17 +338,28 @@ mod env_parse_tests {
         // prior entry to extend, those lines are dropped entirely.
         let dump = "1BAD=x\n-BAD=y\nBASH_FUNC_foo%%=() { :; }\nGOOD=1\n";
         assert_eq!(
-            parse_env_dump(dump),
+            parse_env_lines(dump),
             vec![("GOOD".to_string(), "1".to_string())]
         );
     }
 
     #[test]
-    fn malformed_lines_without_prior_entry_are_dropped() {
+    fn garbage_without_prior_entry_is_dropped() {
         let dump = "garbage\n1BAD=x\nGOOD=1\n";
         assert_eq!(
-            parse_env_dump(dump),
+            parse_env_lines(dump),
             vec![("GOOD".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn rc_echo_looking_like_entry_before_marker_is_ignored() {
+        // rc echo that itself looks like NAME=value must NOT be imported.
+        // Without the marker, the original parser would wrongly import FAKE.
+        let dump = format!("FAKE=notreal\n{}\nREAL=1\n", ENV_DUMP_MARKER);
+        assert_eq!(
+            parse_env_dump(&dump),
+            vec![("REAL".to_string(), "1".to_string())]
         );
     }
 }
