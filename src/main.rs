@@ -105,48 +105,70 @@ fn main() -> Result<()> {
         }
     }
 
-    // ── PATH inheritance fix (macOS / Linux) ────────────────────────────
+    // ── Login-shell environment inheritance (macOS / Linux) ─────────────
     // GUI apps on macOS / Linux launched from Dock / Finder / .desktop
-    // entries get a minimal PATH (typically /usr/bin:/bin:/usr/sbin:/sbin)
-    // — they do NOT source the user's interactive shell rc files. So tools
-    // installed via Homebrew, nvm, volta, asdf, npm-global, cargo, bun,
-    // ~/.local/bin, etc. are invisible to every Command::new() in the
-    // process. Symptom: tool-detection cards stay greyed out even though
-    // `claude` / `codex` / `agy` / `hermes` are clearly installed.
+    // entries get a minimal environment from launchd — they do NOT source
+    // the user's interactive shell rc files. Two consequences we've hit:
+    //   1. PATH is typically /usr/bin:/bin:/usr/sbin:/sbin, so tools
+    //      installed via Homebrew, nvm, volta, asdf, npm-global, cargo,
+    //      bun, ~/.local/bin, etc. are invisible to every Command::new()
+    //      in the process. Symptom: tool-detection cards stay greyed out
+    //      even though `claude` / `codex` / `agy` / `hermes` are clearly
+    //      installed.
+    //   2. Every OTHER variable exported in ~/.zshrc / ~/.bashrc is missing
+    //      too — API keys (OPENAI_API_KEY / ANTHROPIC_API_KEY / KIMI_API_KEY),
+    //      tool feature flags, proxy overrides. AI CLIs then behave
+    //      differently inside Coffee CLI than in Terminal.app: Kimi Code's
+    //      secondary-model experiment stayed disabled in PTY tabs even
+    //      though the user had exported
+    //      KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL=1 in ~/.zshrc — the
+    //      toggle worked in Terminal.app (login shell) but not here.
     //
-    // Fix: ask the user's login shell for its real PATH ONCE at startup
-    // and replace the process PATH. Every downstream subprocess
-    // (tool-detection `which`, PTY spawns, etc.) inherits this and
-    // resolves binaries the same way the user's terminal would.
+    // Fix: ask the user's login shell for its full environment ONCE at
+    // startup via a single `-ilc env` probe. PATH replaces the process
+    // PATH (with a sanity guard); every other variable is imported ONLY
+    // when absent from our process env — the launchd/GUI env always wins,
+    // we just fill gaps. PTY spawns inherit the process env (see the
+    // `std::env::vars()` loop in terminal.rs), so one probe here fixes
+    // every downstream tab and tool-detection `which`.
     //
     // We use `-ilc` (interactive + login) so both .zprofile/.bash_profile
     // AND .zshrc/.bashrc are sourced — matches what the user sees when
-    // they open a fresh terminal window.
+    // they open a fresh terminal window. `env` is an external command, so
+    // fish works too (its exported PATH arrives colon-joined, no special
+    // casing needed).
     #[cfg(not(target_os = "windows"))]
     unsafe {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let basename = std::path::Path::new(&shell)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        // fish prints $PATH space-separated, not colon-separated. Use its
-        // string-join builtin to emit the same format as POSIX shells.
-        let cmd_str = if basename == "fish" {
-            "string join : -- $PATH"
-        } else {
-            "printf '%s' \"$PATH\""
-        };
         if let Ok(out) = std::process::Command::new(&shell)
-            .args(["-ilc", cmd_str])
+            .args(["-ilc", "env"])
             .output()
         {
             if out.status.success() {
-                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                // Sanity guard: a real PATH always contains ':'. If the
-                // shell rc errored out and we got garbage / empty, keep
-                // whatever PATH the OS gave us rather than nuking it.
-                if !path.is_empty() && path.contains(':') {
-                    std::env::set_var("PATH", path);
+                // Shell bookkeeping vars that must NOT be imported into a
+                // GUI process context (PATH is handled with its own guard).
+                const SKIP: &[&str] = &["PATH", "PWD", "OLDPWD", "SHLVL", "_"];
+                for (name, value) in parse_env_dump(&String::from_utf8_lossy(&out.stdout)) {
+                    if name == "PATH" {
+                        // Sanity guard: a real PATH always contains ':'. If
+                        // the shell rc errored out and we got garbage /
+                        // empty, keep whatever PATH the OS gave us rather
+                        // than nuking it.
+                        let path = value.trim();
+                        if !path.is_empty() && path.contains(':') {
+                            std::env::set_var("PATH", path);
+                        }
+                        continue;
+                    }
+                    if SKIP.contains(&name.as_str()) {
+                        continue;
+                    }
+                    // Gap-fill only: a variable the GUI process already has
+                    // (from launchd, `launchctl setenv`, or a direct
+                    // terminal launch) always wins over the rc value.
+                    if std::env::var_os(&name).is_none() {
+                        std::env::set_var(&name, &value);
+                    }
                 }
             }
         }
@@ -190,6 +212,120 @@ fn main() -> Result<()> {
     // Default: launch the GUI. Each tab picks its own CWD at
     // launch time — no initial directory needed.
     server::start_ui(pending_launch)
+}
+
+/// Parse `env` command output into (name, value) pairs for the login-shell
+/// environment inheritance probe in `main()`.
+///
+/// `env` prints one `NAME=value` per line, but two real-world wrinkles:
+///   - Interactive rc files sometimes echo junk to stdout (greeting
+///     banners, `echo` in .zshrc). Those lines are ignored until the first
+///     valid entry appears.
+///   - Values can contain newlines (multiline exports). A line that does
+///     NOT start a new entry is treated as a continuation of the previous
+///     variable's value.
+///
+/// An entry line must match `^[A-Za-z_][A-Za-z0-9_]*=`. Split at the first
+/// '=' — values may themselves contain '=' (base64 blobs, `a=b` pairs).
+#[cfg(not(target_os = "windows"))]
+fn parse_env_dump(dump: &str) -> Vec<(String, String)> {
+    fn is_entry_start(line: &str) -> bool {
+        let bytes = line.as_bytes();
+        if bytes.is_empty() {
+            return false;
+        }
+        let first = bytes[0];
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return false;
+        }
+        let name_len = bytes
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count();
+        bytes.get(name_len) == Some(&b'=')
+    }
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in dump.lines() {
+        if is_entry_start(line) {
+            let eq = line.find('=').unwrap();
+            out.push((line[..eq].to_string(), line[eq + 1..].to_string()));
+        } else if let Some(last) = out.last_mut() {
+            last.1.push('\n');
+            last.1.push_str(line);
+        }
+    }
+    out
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod env_parse_tests {
+    use super::parse_env_dump;
+
+    #[test]
+    fn parses_simple_entries() {
+        let dump = "PATH=/usr/bin:/bin\nKIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL=1\nHOME=/Users/x\n";
+        let vars = parse_env_dump(dump);
+        assert_eq!(
+            vars,
+            vec![
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+                ("KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL".to_string(), "1".to_string()),
+                ("HOME".to_string(), "/Users/x".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn value_may_contain_equals_sign() {
+        let dump = "TOKEN=abc=def==\n";
+        assert_eq!(
+            parse_env_dump(dump),
+            vec![("TOKEN".to_string(), "abc=def==".to_string())]
+        );
+    }
+
+    #[test]
+    fn rc_echo_junk_before_first_entry_is_ignored() {
+        let dump = "Welcome to my shell!\n\x1b[36mhello\x1b[0m\nFOO=bar\n";
+        assert_eq!(
+            parse_env_dump(dump),
+            vec![("FOO".to_string(), "bar".to_string())]
+        );
+    }
+
+    #[test]
+    fn non_entry_lines_extend_multiline_values() {
+        let dump = "MULTI=line1\nline2\nline3\nNEXT=ok\n";
+        assert_eq!(
+            parse_env_dump(dump),
+            vec![
+                ("MULTI".to_string(), "line1\nline2\nline3".to_string()),
+                ("NEXT".to_string(), "ok".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_entry_names() {
+        // Leading digit / dash / percent (bash exported functions look
+        // like `BASH_FUNC_foo%%=...`) must NOT start an entry; with no
+        // prior entry to extend, those lines are dropped entirely.
+        let dump = "1BAD=x\n-BAD=y\nBASH_FUNC_foo%%=() { :; }\nGOOD=1\n";
+        assert_eq!(
+            parse_env_dump(dump),
+            vec![("GOOD".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn malformed_lines_without_prior_entry_are_dropped() {
+        let dump = "garbage\n1BAD=x\nGOOD=1\n";
+        assert_eq!(
+            parse_env_dump(dump),
+            vec![("GOOD".to_string(), "1".to_string())]
+        );
+    }
 }
 
 /// Query the installed WebKit2GTK 4.1 minor version via dlopen +
