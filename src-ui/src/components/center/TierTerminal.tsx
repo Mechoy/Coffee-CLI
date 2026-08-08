@@ -437,8 +437,8 @@ function TierTerminalImpl({
   const isRawShell = tool === 'terminal' || tool === 'remote';
   // Dispatch-only subscription. Never re-renders this component.
   const dispatch = useAppDispatch();
-  // Sentinel scanner needs access to the latest state to look up sibling
-  // panes (same parent tab, sentinelEnabled, etc.). Using the hook re-
+  // Structured peer events need the latest state to look up sibling panes
+  // (same parent tab, notification setting, etc.). Using the hook re-
   // renders this component on every state change, which would thrash the
   // xterm init effects. We keep the value in a ref and sync it with a
   // cheap effect — the onOutput closure reads through the ref.
@@ -481,15 +481,9 @@ function TierTerminalImpl({
   const lastOutputAtRef = useRef(0);
   const [processExited, setProcessExited] = useState(false);
   const [startFailed, setStartFailed] = useState(false);
-  // Rolling buffer for agent-to-agent marker scanning. PTY chunks can split
-  // `[COFFEE-TELL:...]` / `[COFFEE-DONE:...]` across boundaries; the buffer
-  // reassembles chunks so markers match reliably. `markerScanOffsetRef`
-  // tracks how far we've already scanned to avoid re-firing the same
-  // dispatch when a later chunk arrives and re-triggers the scan. See the
-  // scanner in `onData` below for the consume/advance logic.
-  const markerScanBufRef = useRef<string>('');
-  const markerScanOffsetRef = useRef<number>(0);
-  const recentDoneMarkersRef = useRef<Map<string, number>>(new Map());
+  // Structured task events are exactly-once in Rust; keep a small frontend
+  // dedupe set as protection against listener remounts replaying an event.
+  const handledPeerJobsRef = useRef<Set<string>>(new Set());
 
   // ── Stale-frame ghost suppression on tab switch (issue #47) ──────────────
   // Inactive tabs are display:none (CenterPanel). While hidden, xterm's WebGL
@@ -1105,6 +1099,11 @@ function TierTerminalImpl({
     // working vs non-working; permission prompts share its static idle prefix.
     let lastTabTitle: string | undefined;
     let grokStatus: AgentStatus = 'idle';
+    const syncNativeStatus = (status: AgentStatus) => {
+      if (nativeAgentStatusRef.current === status) return;
+      nativeAgentStatusRef.current = status;
+      commands.tierTerminalAgentStatus(sessionId, status).catch(() => {});
+    };
     const clearGrokPermissionRelease = () => {
       if (grokPermissionReleaseTimerRef.current !== undefined) {
         window.clearTimeout(grokPermissionReleaseTimerRef.current);
@@ -1112,7 +1111,7 @@ function TierTerminalImpl({
       }
     };
     const setGrokStatus = (status: AgentStatus) => {
-      nativeAgentStatusRef.current = status;
+      syncNativeStatus(status);
       if (status === grokStatus) return;
       grokStatus = status;
       dispatch({ type: 'SET_AGENT_STATUS', id: sessionId, status });
@@ -1122,12 +1121,12 @@ function TierTerminalImpl({
       if (tool === 'claude') {
         const parsed = parseClaudeTerminalTitle(title);
         displayTitle = parsed.displayTitle;
-        nativeAgentStatusRef.current = parsed.status;
+        syncNativeStatus(parsed.status);
         dispatch({ type: 'SET_AGENT_STATUS', id: sessionId, status: parsed.status });
       } else if (tool === 'codex') {
         const parsed = parseCodexTerminalTitle(title);
         displayTitle = parsed.displayTitle;
-        nativeAgentStatusRef.current = parsed.status;
+        syncNativeStatus(parsed.status);
         dispatch({ type: 'SET_AGENT_STATUS', id: sessionId, status: parsed.status });
       } else if (tool === 'grok') {
         const parsed = parseGrokTerminalTitle(title);
@@ -1204,138 +1203,56 @@ function TierTerminalImpl({
             altScreenRef.current = false;
           }
 
-          // ── Sentinel Protocol scanner ───────────────────────────
-          // Sentinel sits on TOP of MCP. Forward dispatch (pane A → pane B)
-          // is handled by the MCP `send_to_pane` tool (see mcp_server.rs)
-          // which gives the dispatching agent structured discovery +
-          // failure responses. What this scanner handles is the BACKWARD
-          // completion receipt:
-          //
-          //   [COFFEE-DONE:pane-N->pane-M]
-          //     pane N has finished a task and wants to notify pane M.
-          //     Gated by sentinelEnabled on BOTH panes (default-on): with
-          //     sentinel on, the frontend lights a green dot on pane N's
-          //     badge AND injects "[From pane-N] Task complete." + Enter
-          //     into pane M's PTY input, which wakes pane M's LLM turn
-          //     loop without polling. With sentinel off, the marker sits
-          //     inert in pane N's scrollback and the user has to eyeball
-          //     completion instead.
-          //
-          // We STRIP ANSI escape sequences before scanning. Claude Code's
-          // TUI wraps response text in CSI sequences (color, bold, cursor
-          // positioning, erase-line). Those bytes sit between marker
-          // literals and around the text, breaking any regex that treats
-          // the raw stream as plain text. Stripping CSI/OSC/single-char
-          // escapes normalises the buffer so the regex sees what the
-          // user sees.
-          //
-          // Buffer + offset:
-          //   - PTY onData is chunky (256B–4KB); markers can split across
-          //     chunks, so we accumulate into a buffer before scanning.
-          //   - 8 KB bound keeps the buffer from growing unbounded.
-          //   - `markerScanOffsetRef` advances past processed matches so
-          //     the same DONE never fires twice when a later chunk
-          //     re-triggers the scan.
+        },
+        onPeerTask: (event) => {
+          if (!mounted || handledPeerJobsRef.current.has(event.job_id)) return;
+          const sourceMatch = event.source_id.match(/^(.+)::pane-(\d+)$/);
+          const targetMatch = sessionId.match(/^(.+)::pane-(\d+)$/);
+          if (!sourceMatch || !targetMatch || sourceMatch[1] !== targetMatch[1]) return;
 
-          // Strip CSI/OSC/single-char ANSI escapes from the chunk before
-          // appending. xterm still gets the raw `data` with escapes
-          // intact for rendering; only the scan buffer is normalised.
-          const cleanData = data
-            .replace(/\x1b\[[0-9;?]*[@-~]/g, '')      // CSI (most common)
-            .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '') // OSC (title, hyperlink)
-            .replace(/\x1b[@-Z\\-_]/g, '');            // single-char escape
-          markerScanBufRef.current += cleanData;
+          const tabId = sourceMatch[1];
+          const sourcePaneIdx = Number(sourceMatch[2]);
+          const targetPaneIdx = Number(targetMatch[2]);
+          const tab = appStateRef.current.terminals.find(item => item.id === tabId);
+          const panes = tab?.multiAgent?.panes ?? [];
+          const sourcePane = panes.find(pane => pane.paneIdx === sourcePaneIdx);
+          const targetPane = panes.find(pane => pane.paneIdx === targetPaneIdx);
+          if (!sourcePane || !targetPane || sourcePane.sentinelEnabled === false || targetPane.sentinelEnabled === false) return;
 
-          const MAX_BUF = 8192;
-          if (markerScanBufRef.current.length > MAX_BUF) {
-            const toTrim = markerScanBufRef.current.length - MAX_BUF;
-            markerScanBufRef.current = markerScanBufRef.current.slice(toTrim);
-            markerScanOffsetRef.current = Math.max(
-              0,
-              markerScanOffsetRef.current - toTrim
-            );
+          handledPeerJobsRef.current.add(event.job_id);
+          if (handledPeerJobsRef.current.size > 128) {
+            const oldest = handledPeerJobsRef.current.values().next().value;
+            if (oldest) handledPeerJobsRef.current.delete(oldest);
           }
 
-          const unscanned = markerScanBufRef.current.slice(
-            markerScanOffsetRef.current
-          );
-          if (unscanned.includes('[COFFEE-DONE:pane')) {
-            const paneIdMatch = sessionId.match(/^(.+)::pane-(\d+)$/);
-            if (paneIdMatch) {
-              const tabId = paneIdMatch[1];
-              const sourcePaneIdx = parseInt(paneIdMatch[2], 10);
-              const tab = appStateRef.current.terminals.find(t => t.id === tabId);
-              const panes = tab?.multiAgent?.panes ?? [];
-              let advancedTo = 0;
-
-              // DONE: backward receipt, sentinel-gated on the emitter side.
-              // Canonical pane ids include a hyphen (`pane-2`). Accept the
-              // pre-v3.3 legacy spelling (`pane2`) as well so an older prompt
-              // already loaded in a running agent can still wake its peer.
-              const doneRegex = /\[COFFEE-DONE:pane-?(\d+)->pane-?(\d+)\]/g;
-              let doneM: RegExpExecArray | null;
-              while ((doneM = doneRegex.exec(unscanned)) !== null) {
-                const emitter = parseInt(doneM[1], 10);
-                const target = parseInt(doneM[2], 10);
-                advancedTo = Math.max(advancedTo, doneM.index + doneM[0].length);
-
-                // Trust the terminal session identity, not text embedded in
-                // its output. A pane cannot claim another pane completed.
-                if (emitter !== sourcePaneIdx) continue;
-
-                // Full-screen TUIs can repaint the same final line. Suppress
-                // rapid duplicate wake-ups without blocking a later task on
-                // the same pane route.
-                const markerKey = `${emitter}->${target}`;
-                const now = Date.now();
-                const lastSeen = recentDoneMarkersRef.current.get(markerKey) ?? 0;
-                if (now - lastSeen < 2000) continue;
-                recentDoneMarkersRef.current.set(markerKey, now);
-
-                const emitterPane = panes.find(p => p.paneIdx === emitter);
-                if (emitterPane && emitterPane.sentinelEnabled !== false) {
-                  dispatch({ type: 'SET_PANE_COMPLETION', tabId, paneIdx: emitter, ts: Date.now() });
-                  const targetPane = panes.find(p => p.paneIdx === target);
-                  let wakeTarget: (() => void) | undefined;
-                  if (targetPane && targetPane.sentinelEnabled !== false && targetPane.tool !== null && target !== emitter) {
-                    const targetId = `${tabId}::pane-${target}`;
-                    const notify = `[From pane-${emitter}] Task complete.`;
-                    // Completion receipts can arrive from several panes in
-                    // the same render frame. Serialize them so each delayed
-                    // CR submits exactly one notification.
-                    wakeTarget = () => {
-                      getTabActions(targetId)?.enqueueSubmission(notify);
-                    };
-                  }
-                  // The PTY emitter stores this chunk in read_pane's buffer
-                  // before emitting it. Commit the matching backend state
-                  // before waking the caller so its immediate read cannot
-                  // observe the old `working` state. The emitter remains
-                  // complete even when its requested target no longer exists.
-                  commands.tierTerminalMarkDone(sessionId)
-                    .then(() => wakeTarget?.())
-                    .catch((error) => {
-                      console.warn('[Sentinel] Failed to mark pane complete:', error);
-                      wakeTarget?.();
-                    });
-                }
-              }
-
-              if (advancedTo > 0) {
-                markerScanOffsetRef.current += advancedTo;
-              }
-            }
+          if (event.status === 'completed') {
+            dispatch({ type: 'SET_PANE_COMPLETION', tabId, paneIdx: sourcePaneIdx, ts: Date.now() });
           }
+          const shortJobId = event.job_id.slice(0, 8);
+          const notify = event.status === 'completed'
+            ? `[From pane-${sourcePaneIdx}] Task ${shortJobId} complete.`
+            : `[From pane-${sourcePaneIdx}] Task ${shortJobId} failed: ${event.error ?? event.status}.`;
+
+          // Tab actions register in a sibling effect. A completion arriving
+          // during initial mount is retained briefly instead of being lost.
+          let attempts = 0;
+          const enqueue = () => {
+            if (!mounted) return;
+            if (getTabActions(sessionId)?.enqueueSubmission(notify)) return;
+            attempts += 1;
+            if (attempts < 20) window.setTimeout(enqueue, 100);
+          };
+          enqueue();
         },
         onStatus: (running, _exitCode) => {
           if (!mounted || running) return;
           setProcessExited(true);
           if (usesNativeStatus) {
-            nativeAgentStatusRef.current = 'idle';
+            syncNativeStatus('idle');
             dispatch({ type: 'SET_AGENT_STATUS', id: sessionId, status: 'idle' });
           }
         },
-        onExit: (_exitCode) => {
+        onExit: (exitCode) => {
           // Authoritative "process is actually dead" signal from the Rust
           // child-watcher thread. Critical for the lockup scenario where an
           // intermediate cmd.exe keeps the PTY slave open so reader never
@@ -1346,9 +1263,13 @@ function TierTerminalImpl({
           // upstream tool's own output). The CLI's own exit text, if any,
           // already speaks for itself.
           if (!mounted) return;
+          commands.tierTerminalFailTask(
+            sessionId,
+            `Peer process exited with code ${exitCode}`,
+          ).catch(() => {});
           setProcessExited(true);
           if (usesNativeStatus) {
-            nativeAgentStatusRef.current = 'idle';
+            syncNativeStatus('idle');
             dispatch({ type: 'SET_AGENT_STATUS', id: sessionId, status: 'idle' });
           }
         },

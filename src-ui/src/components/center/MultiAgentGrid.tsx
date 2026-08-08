@@ -196,7 +196,7 @@ export function MultiAgentGrid({ tab, hasBg, bgUrl, bgType, paneCount = 4 }: Pro
                   3-button CLI picker without disturbing the other panes
                   or closing the whole Tab. */}
             {(() => {
-              // Green dot if sentinel detected a pane's COFFEE-DONE marker
+              // Green dot after a structured MCP task completion event.
               // within the last 30 minutes. Past that we assume the pane has
               // started a new turn and the "done" signal is stale.
               const showDot = sentinelEnabled && pane.completionTs

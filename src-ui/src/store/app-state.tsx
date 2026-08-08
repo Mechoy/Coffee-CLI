@@ -119,12 +119,10 @@ export interface MultiAgentPane {
   // and use the tab-level folderPath (all 4 panes share one workspace because
   // they coordinate via MCP against that workspace's config).
   folderPath?: string | null;
-  // Sentinel Protocol (default-on per pane; explicit false disables it).
-  // TierTerminal scans the
-  // PTY output stream of this pane for `[COFFEE-DONE:pane-N->pane-M]`
-  // that the user instructs their agent to emit on task completion. On a
-  // match, completionTs is set to Date.now() — the pane number badge
-  // renders a small green dot while the timestamp is fresh.
+  // Structured peer notifications (default-on per pane; explicit false
+  // disables automatic wake-up). Completion is emitted by the identity-bound
+  // MCP task state machine, never parsed from terminal text. On a completed
+  // event, completionTs drives the pane badge's temporary green dot.
   sentinelEnabled?: boolean;
   completionTs?: number;
 }

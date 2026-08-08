@@ -465,6 +465,9 @@ pub type SharedSession = Arc<Mutex<std::collections::HashMap<String, TerminalSes
 pub struct SessionActivity {
     pub last_output_at: Instant,
     pub last_status: String,
+    /// Authoritative CLI title status when the frontend parser supports it.
+    /// None for tools such as OpenCode that do not expose a native status.
+    pub native_status: Option<String>,
 }
 
 impl SessionActivity {
@@ -920,6 +923,7 @@ pub fn spawn(
     let activity = Arc::new(Mutex::new(SessionActivity {
         last_output_at: Instant::now() - std::time::Duration::from_secs(2),
         last_status: "wait_input".to_string(),
+        native_status: None,
     }));
 
     // Store session with shared writer reference and master kept alive.
@@ -1159,8 +1163,8 @@ pub fn spawn(
                     }
                 }
 
-                // Keep the MCP result tail current before the frontend can
-                // observe a DONE marker in this same chunk and wake a peer.
+                // Keep the bounded terminal-inspection tail current before
+                // publishing the same chunk to the frontend.
                 if let Ok(mut ring) = output_buffer_for_emitter.lock() {
                     ring.push(data.clone());
                 }
@@ -1361,6 +1365,7 @@ mod tests {
         let mut activity = SessionActivity {
             last_output_at: Instant::now(),
             last_status: "wait_input".to_string(),
+            native_status: None,
         };
 
         activity.mark_working();
@@ -1375,6 +1380,7 @@ mod tests {
         let mut activity = SessionActivity {
             last_output_at: Instant::now(),
             last_status: "working".to_string(),
+            native_status: None,
         };
 
         activity.mark_done();

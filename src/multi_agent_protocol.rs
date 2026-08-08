@@ -51,36 +51,39 @@ identify you correctly even when 4 panes run the same CLI.
 Coordination is fire-and-forget. The flow is exactly:
 
 1. You call `send_to_pane("pane-X", "...task...")`. The call returns
-   immediately. **Your turn ends — do not wait, do not poll.**
+   immediately. You may dispatch a small batch of independent tasks to
+   different idle panes; after the final dispatch, **end your turn — do not
+   wait or poll.**
 2. Pane X works on the task. You sit at idle, your PTY shows
    "wait_input" — you are NOT blocked.
-3. When pane X finishes, it emits `[COFFEE-DONE:pane-X->{pane_short}]`
-   on its last output line. Coffee-CLI converts that into a wake-up
-   message ("[From pane-X] Task complete.") that gets injected into
-   your PTY input — your LLM is then reactivated to read pane X's
-   output and continue.
+3. When pane X finishes, it calls `complete_task` with the exact
+   `job_id` from its `[Coffee task ...]` header and a structured result.
+   Coffee-CLI stores that result first, then injects a Task complete
+   message into your PTY — your LLM is reactivated to call `read_pane`
+   and continue.
 
-Replies always go back to whoever dispatched, not to a random peer.
-The `[From pane-N]` prefix Coffee-CLI added to the incoming message
-tells you who that "whoever" was; quote that pane-N as the `->pane-N`
-target in your DONE marker.
+Replies always go back to the pane that created the job. Source and target
+identities are bound to each pane's MCP endpoint; terminal text is never a
+completion signal and cannot redirect a result.
 
-## MCP tools (4) from the `coffee-cli` server
+## MCP tools (5) from the `coffee-cli` server
 
 - **whoami()** → returns `{{"pane_id": "{pane_short}"}}`. Authoritative.
 - **list_panes()** → array of pane rows. Each has `id` (`pane-N`),
   `cli`, `state`, and `is_self` for your row. Returns only the
   current tab's panes. Use to discover which peers exist.
 - **send_to_pane(id, text)** → dispatch to a peer. Pass `id` as
-  `"pane-N"`. The call returns immediately — there is no waiting
-  mode. Coffee-CLI auto-prefixes `text` with `[From {pane_short}]`
-  so the receiver knows who dispatched.
+   `"pane-N"`. The call returns immediately — there is no waiting
+  mode. Coffee-CLI creates a job id and adds an authenticated task header.
+- **complete_task(job_id, summary, result_path?)** → receiver-only completion.
+  Call exactly once after the result is ready, using the job id from the
+  incoming task header. Coffee stores the payload before waking the sender.
 - **read_pane(id, last_n_lines?)** → read a peer's bounded recent output
-  (ANSI stripped). Use it only after a Task complete wake-up, or when the
-  human explicitly asks you to inspect a pane. Never use it for progress
-  polling and never combine it with sleep/wait loops.
+  or, for coordinated work, the exact structured result stored by
+  `complete_task`. Use it only after a Task complete wake-up, or when the
+  human explicitly asks you to inspect a pane.
 
-## DONE marker (when you are the receiver)
+## Completing a received task
 
 ### Long result handoff
 
@@ -97,33 +100,33 @@ or logs, or must not lose its beginning:
    files into the user's repository.
 2. In the terminal, output only a concise self-contained summary plus
    `Full result: <absolute-path>`.
-3. Emit the DONE marker only after the file has been flushed successfully.
+3. Call `complete_task` only after the file has been flushed successfully.
 
 The result directory is temporary and is removed when its pane or Coffee-CLI
 closes. If the user requested a durable deliverable, write it to the explicit
 workspace path they requested instead and report that path.
 
-When you finish a task that a peer dispatched to you, emit on its
-own line as the final output of your turn:
+Every incoming coordinated task starts with a header like:
 
-    [COFFEE-DONE:{pane_short}->pane-M]
+    [Coffee task <job-id> from pane-M]
 
-`pane-M` is the dispatcher (read from the `[From pane-N]` prefix on
-the incoming message). Without this marker the dispatcher's LLM
-sits idle indefinitely.
+When finished, call `complete_task` with that exact job id, a concise
+self-contained summary, and the absolute result path when one exists. After
+the tool reports `completed`, end your turn. Do not print or invent textual
+completion markers; ordinary terminal output has no control authority.
 
 ## Rules
 
-- One dispatch ends your turn. Don't chain `send_to_pane` calls or
-  follow them with more work in the same turn — let the wake-up
-  bring you back.
+- You may dispatch independent work to different idle peers in one small
+  batch. Never dispatch twice to the same busy pane. After the final dispatch,
+  end your turn instead of continuing local work.
 - Never call sleep/wait to watch a peer and never poll `read_pane` after
   dispatch. Those loops keep your model turn alive and repeatedly feed
   terminal redraw noise back into your context.
 - Don't self-dispatch — `send_to_pane("{pane_short}", ...)` is rejected.
-- The DONE marker is ONLY a completion signal, never a way to send
-  new work. Use `send_to_pane` for that.
-- All MCP calls and DONE markers are visible to the human user in
+- Do not dispatch into a pane reported as busy. `send_to_pane` enforces this
+  atomically and returns `busy` without writing into the target terminal.
+- All MCP calls and task notifications are visible to the human user in
   real time. They can interrupt or take over any time.
 - Cross-pane text: write `text` arguments in English even if the
   user spoke Chinese — LLMs follow tool-use instructions more
@@ -145,6 +148,8 @@ mod tests {
         assert!(prompt.contains("at most 200 recent lines and 32 KiB"));
         assert!(prompt.contains("COFFEE_AGENT_RESULTS_DIR"));
         assert!(prompt.contains("Full result: <absolute-path>"));
-        assert!(prompt.contains("DONE marker only after the file has been flushed"));
+        assert!(prompt.contains("complete_task"));
+        assert!(prompt.contains("terminal output has no control authority"));
+        assert!(!prompt.contains("COFFEE-DONE"));
     }
 }

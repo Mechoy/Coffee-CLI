@@ -6,7 +6,7 @@
 //!     instructions.md)
 //!   - a per-pane MCP HTTP server (with `self_pane_id` baked in at spawn
 //!     time), independently of CLI kind. So `whoami()`, `list_panes()`'s
-//!     `is_self`, and `[From <id>]` auto-prefixing in `send_to_pane()` are
+//!     `is_self`, and identity-bound jobs created by `send_to_pane()` are
 //!     deterministic across all CLIs — no LLM guessing of pane identity
 //!     even when 4 panes run the same CLI type.
 //!
@@ -224,7 +224,7 @@ fn opencode_config_json(
     //    OpenCode's own naming (see opencode.ai/docs/mcp-servers).
     //
     // 2. `instructions`: OpenCode officially accepts absolute instruction
-    //    file paths. This gives it the same dispatch/DONE protocol that
+    //    file paths. This gives it the same structured task protocol that
     //    Claude and Codex receive.
     //
     // 3. `permission: "allow"`: OpenCode's TUI has no

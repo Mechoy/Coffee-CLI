@@ -1,25 +1,25 @@
 //! Coffee-CLI multi-agent MCP server.
 //!
-//! Exposes 4 tools over HTTP Streamable MCP transport:
+//! Exposes structured coordination tools over HTTP Streamable MCP transport:
 //! - `whoami()` — identify the caller's pane.
 //! - `list_panes()` — enumerate panes in the current multi-agent Tab with
 //!   their CLI type, state (empty / idle / busy / terminated), and titles.
 //! - `send_to_pane(id, text)` — inject a task into another pane's PTY and
 //!   return immediately.
-//! - `read_pane(id, last_n_lines)` — read bounded recent output from another
-//!   pane after its completion notification (ANSI-stripped).
+//! - `complete_task(job_id, summary, result_path)` — atomically publish a
+//!   task result and notify the dispatcher.
+//! - `read_pane(id, last_n_lines)` — read a peer's structured task result,
+//!   falling back to bounded terminal output for explicit inspection.
 //!
 //! HTTP transport (not stdio) because Coffee-CLI is a resident Tauri
 //! process and can't be spawned as a subprocess by each CLI. Every pane gets
 //! its own `127.0.0.1:<random>` listener and temporary CLI configuration;
 //! user and workspace configuration files are left untouched.
 //!
-//! This is the FORWARD-DISPATCH layer (agent A → agent B). The Sentinel
-//! Protocol sitting on top of MCP adds a BACKWARD receipt: when the
-//! dispatched agent finishes, it emits `[COFFEE-DONE:pane-N->pane-M]` into
-//! its own PTY output, and the frontend injects a "task complete"
-//! notification into the dispatcher's PTY input so the dispatcher's
-//! turn-loop can wake up without polling. See TierTerminal.tsx.
+//! Task state never comes from terminal text. Each dispatch creates a job
+//! bound to its source and target panes. Only the target's identity-bound MCP
+//! endpoint can complete that job, and the result is stored before a typed
+//! Tauri event wakes the dispatcher. Terminal output is presentation only.
 //!
 //! History: MCP was retired in 2026-04-24 in a misread of the user's
 //! product intent ("sentinel is on-top-of MCP, not replacement-for") and
@@ -27,8 +27,9 @@
 //! log for the embarrassing details.
 
 use std::{
+    collections::HashMap,
     io::Write,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -53,6 +54,219 @@ use rmcp::{
     },
 };
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
+
+const COMPLETION_SUMMARY_MAX_BYTES: usize = 16 * 1024;
+const COMPLETION_PATH_MAX_BYTES: usize = 4 * 1024;
+const MAX_TASK_RECORDS: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneTaskStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+struct PaneTaskRecord {
+    job_id: String,
+    source_id: String,
+    target_id: String,
+    status: PaneTaskStatus,
+    summary: Option<String>,
+    result_path: Option<String>,
+    error: Option<String>,
+    created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PaneTaskEvent {
+    pub job_id: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub status: PaneTaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Default)]
+struct TaskCoordinatorState {
+    records: HashMap<String, PaneTaskRecord>,
+    current_by_target: HashMap<String, String>,
+    latest_by_route: HashMap<(String, String), String>,
+}
+
+#[derive(Default)]
+pub struct TaskCoordinator {
+    state: Mutex<TaskCoordinatorState>,
+}
+
+impl TaskCoordinator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn start(&self, source_id: &str, target_id: &str) -> Result<String, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "task coordinator poisoned".to_string())?;
+        if let Some(job_id) = state.current_by_target.get(target_id) {
+            if let Some(record) = state.records.get(job_id) {
+                if record.status == PaneTaskStatus::Running {
+                    return Err(format!(
+                        "target pane is busy with job {} from {}",
+                        record.job_id,
+                        pane_short(&record.source_id)
+                    ));
+                }
+            }
+        }
+
+        prune_task_records(&mut state);
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let record = PaneTaskRecord {
+            job_id: job_id.clone(),
+            source_id: source_id.to_string(),
+            target_id: target_id.to_string(),
+            status: PaneTaskStatus::Running,
+            summary: None,
+            result_path: None,
+            error: None,
+            created_at: epoch_seconds(),
+        };
+        state
+            .current_by_target
+            .insert(target_id.to_string(), job_id.clone());
+        state.records.insert(job_id.clone(), record);
+        Ok(job_id)
+    }
+
+    fn abort_start(&self, job_id: &str) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(record) = state.records.remove(job_id) else {
+            return;
+        };
+        if state.current_by_target.get(&record.target_id).map(String::as_str) == Some(job_id) {
+            state.current_by_target.remove(&record.target_id);
+        }
+    }
+
+    fn complete(
+        &self,
+        target_id: &str,
+        job_id: &str,
+        summary: String,
+        result_path: Option<String>,
+    ) -> Result<(PaneTaskRecord, bool), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "task coordinator poisoned".to_string())?;
+        let current = state.current_by_target.get(target_id).map(String::as_str);
+        if current != Some(job_id) {
+            return Err("job is stale or does not belong to this pane".to_string());
+        }
+        let (source_id, target_id_owned, record_clone) = {
+            let record = state
+                .records
+                .get_mut(job_id)
+                .ok_or_else(|| "job not found".to_string())?;
+            if record.target_id != target_id {
+                return Err("job target identity mismatch".to_string());
+            }
+            if record.status == PaneTaskStatus::Completed {
+                return Ok((record.clone(), false));
+            }
+            if record.status != PaneTaskStatus::Running {
+                return Err(format!("job is already {:?}", record.status));
+            }
+            record.status = PaneTaskStatus::Completed;
+            record.summary = Some(summary);
+            record.result_path = result_path;
+            (
+                record.source_id.clone(),
+                record.target_id.clone(),
+                record.clone(),
+            )
+        };
+        state.latest_by_route.insert(
+            (source_id, target_id_owned),
+            job_id.to_string(),
+        );
+        Ok((record_clone, true))
+    }
+
+    pub fn fail_target(&self, target_id: &str, error: String) -> Option<PaneTaskEvent> {
+        let mut state = self.state.lock().ok()?;
+        let job_id = state.current_by_target.get(target_id)?.clone();
+        let (source_id, target_id_owned) = {
+            let record = state.records.get_mut(&job_id)?;
+            if record.status != PaneTaskStatus::Running {
+                return None;
+            }
+            record.status = PaneTaskStatus::Failed;
+            record.error = Some(error.clone());
+            (record.source_id.clone(), record.target_id.clone())
+        };
+        state.current_by_target.remove(target_id);
+        state.latest_by_route.insert(
+            (source_id.clone(), target_id_owned.clone()),
+            job_id.clone(),
+        );
+        Some(PaneTaskEvent {
+            job_id,
+            source_id: target_id_owned,
+            target_id: source_id,
+            status: PaneTaskStatus::Failed,
+            error: Some(error),
+        })
+    }
+
+    fn running_for_target(&self, target_id: &str) -> Option<PaneTaskRecord> {
+        let state = self.state.lock().ok()?;
+        let job_id = state.current_by_target.get(target_id)?;
+        let record = state.records.get(job_id)?;
+        (record.status == PaneTaskStatus::Running).then(|| record.clone())
+    }
+
+    fn latest_for_route(&self, source_id: &str, target_id: &str) -> Option<PaneTaskRecord> {
+        let state = self.state.lock().ok()?;
+        if let Some(current_id) = state.current_by_target.get(target_id) {
+            if let Some(record) = state.records.get(current_id) {
+                if record.source_id == source_id && record.status == PaneTaskStatus::Running {
+                    return Some(record.clone());
+                }
+            }
+        }
+        let job_id = state
+            .latest_by_route
+            .get(&(source_id.to_string(), target_id.to_string()))?;
+        state.records.get(job_id).cloned()
+    }
+}
+
+fn prune_task_records(state: &mut TaskCoordinatorState) {
+    if state.records.len() < MAX_TASK_RECORDS {
+        return;
+    }
+    let mut terminal: Vec<(u64, String)> = state
+        .records
+        .values()
+        .filter(|record| record.status != PaneTaskStatus::Running)
+        .map(|record| (record.created_at, record.job_id.clone()))
+        .collect();
+    terminal.sort_by_key(|(created_at, _)| *created_at);
+    let remove_count = state.records.len().saturating_sub(MAX_TASK_RECORDS - 1);
+    for (_, job_id) in terminal.into_iter().take(remove_count) {
+        state.records.remove(&job_id);
+        state.latest_by_route.retain(|_, value| value != &job_id);
+        state.current_by_target.retain(|_, value| value != &job_id);
+    }
+}
 
 // ---------- Pane abstraction (in-memory mock for v1.0 day 1-2) ----------
 
@@ -113,15 +327,19 @@ pub struct PaneInfo {
 /// the other panes' PTYs.
 pub struct PaneStore {
     session: SharedSession,
+    tasks: Arc<TaskCoordinator>,
+    app: AppHandle,
     /// ANSI escape sequence matcher, reused across reads.
     /// Same pattern as terminal.rs emitter thread (line ~738).
     ansi_re: regex::Regex,
 }
 
 impl PaneStore {
-    pub fn new(session: SharedSession) -> Self {
+    pub fn new(session: SharedSession, tasks: Arc<TaskCoordinator>, app: AppHandle) -> Self {
         Self {
             session,
+            tasks,
+            app,
             ansi_re: regex::Regex::new(
                 r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\].*?(?:\x07|\x1b\\)|\x1b.",
             )
@@ -145,11 +363,13 @@ impl PaneStore {
                         let (status, last_at) = match sess.activity.lock() {
                             Ok(act) => {
                                 let stale = act.last_output_at.elapsed() > Duration::from_secs(15);
-                                let status = if act.last_status == "working" && stale {
-                                    "wait_input".to_string()
-                                } else {
-                                    act.last_status.clone()
-                                };
+                                let status = act.native_status.clone().unwrap_or_else(|| {
+                                    if act.last_status == "working" && stale {
+                                        "wait_input".to_string()
+                                    } else {
+                                        act.last_status.clone()
+                                    }
+                                });
                                 (status, act.last_output_at)
                             }
                             Err(_) => ("unknown".to_string(), Instant::now()),
@@ -173,10 +393,15 @@ impl PaneStore {
                 let elapsed = now_instant.saturating_duration_since(last_at).as_secs();
                 let last_activity_at = now_epoch.saturating_sub(elapsed);
                 let pane_label = pane_short(&id);
+                let task_running = self.tasks.running_for_target(&id).is_some();
                 PaneInfo {
                     title: pane_label.clone(),
                     cli: tool_name.unwrap_or_else(|| "shell".to_string()),
-                    state: status_to_pane_state(&status),
+                    state: if task_running {
+                        PaneState::Busy
+                    } else {
+                        status_to_pane_state(&status)
+                    },
                     last_activity_at,
                     id: pane_label,
                     full_id: id,
@@ -517,7 +742,7 @@ impl PaneStore {
     }
 
     /// Return the last `last_n` lines of the pane's ANSI-stripped output,
-    /// plus an `is_idle` flag derived from `last_status`.
+    /// plus an `is_idle` flag derived from native CLI status when available.
     async fn read(&self, id: &str, last_n: usize) -> Result<(BoundedOutput, bool), String> {
         let id = id.to_string();
         let session = self.session.clone();
@@ -540,13 +765,22 @@ impl PaneStore {
                 (ring.joined(), ring.prefix_truncated())
             };
 
-            // Silence is not completion: a CLI can spend minutes waiting for
-            // an API response without producing terminal output. Only the
-            // explicit prompt marker makes peer output eligible for return.
+            // Native OSC-title status is authoritative. Older/unsupported
+            // CLIs fall back to the legacy activity state; its silence escape
+            // hatch is intentionally limited to explicit terminal inspection,
+            // never coordinated job completion.
             let is_idle = sess
                 .activity
                 .lock()
-                .map(|a| a.is_done())
+                .map(|activity| match activity.native_status.as_deref() {
+                    Some("idle") => true,
+                    Some(_) => false,
+                    None => {
+                        activity.is_done()
+                            || (activity.last_status == "working"
+                                && activity.last_output_at.elapsed() > Duration::from_secs(15))
+                    }
+                })
                 .unwrap_or(false);
 
             drop(guard);
@@ -561,6 +795,72 @@ impl PaneStore {
         })
         .await
         .map_err(|e| format!("blocking task join failed: {}", e))?
+    }
+
+    async fn mark_terminal_done(&self, id: &str) {
+        let id = id.to_string();
+        let session = self.session.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let Ok(guard) = session.lock() else {
+                return;
+            };
+            let Some(sess) = guard.get(&id) else {
+                return;
+            };
+            if let Ok(mut activity) = sess.activity.lock() {
+                activity.mark_done();
+            };
+        })
+        .await;
+    }
+
+    async fn ensure_dispatch_ready(&self, id: &str) -> Result<(), String> {
+        let id = id.to_string();
+        let session = self.session.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let guard = session
+                .lock()
+                .map_err(|_| "session map poisoned".to_string())?;
+            let sess = guard
+                .get(&id)
+                .ok_or_else(|| format!("pane not found: {id}"))?;
+            let activity = sess
+                .activity
+                .lock()
+                .map_err(|_| "activity poisoned".to_string())?;
+            match activity.native_status.as_deref() {
+                Some("idle") => Ok(()),
+                Some("working") | Some("wait_input") => {
+                    Err("target pane's native CLI status is busy".to_string())
+                }
+                Some(status) => Err(format!(
+                    "target pane reported unknown native status: {status}"
+                )),
+                None if activity.last_status == "working"
+                    && activity.last_output_at.elapsed() <= Duration::from_secs(15) =>
+                {
+                    Err("target pane recently received a submitted prompt".to_string())
+                }
+                None => Ok(()),
+            }
+        })
+        .await
+        .map_err(|error| format!("native status check failed: {error}"))?
+    }
+
+    fn emit_task_event(&self, record: &PaneTaskRecord) -> Result<(), String> {
+        self.app
+            .emit(
+                "multi-agent-task-complete",
+                PaneTaskEvent {
+                    job_id: record.job_id.clone(),
+                    source_id: record.target_id.clone(),
+                    target_id: record.source_id.clone(),
+                    status: record.status.clone(),
+                    error: record.error.clone(),
+                },
+            )
+            .map_err(|error| format!("completion event emit failed: {error}"))
     }
 }
 
@@ -629,6 +929,20 @@ pub struct ReadPaneArgs {
     pub last_n_lines: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct CompleteTaskArgs {
+    /// Exact job id included in the `[Coffee task ...]` dispatch header.
+    pub job_id: String,
+    /// Concise, self-contained result for the dispatching pane. Keep large
+    /// reports in `COFFEE_AGENT_RESULTS_DIR` and provide `result_path`.
+    pub summary: String,
+    /// Optional absolute path to a complete result artifact. The file must
+    /// already exist and be non-empty before completion is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_path: Option<String>,
+}
+
 
 /// Extract the tab id portion of a pane id (`${tab_id}::pane-${idx}`).
 /// Used to scope `list_panes` and `send_to_pane` to the caller's own
@@ -690,6 +1004,47 @@ fn same_tab(left: &str, right: &str) -> bool {
     tab_prefix(left) == tab_prefix(right)
 }
 
+fn validate_completion_payload(
+    summary: String,
+    result_path: Option<String>,
+) -> Result<(String, Option<String>), String> {
+    let summary = summary.trim().to_string();
+    if summary.is_empty() {
+        return Err("summary must not be empty".to_string());
+    }
+    if summary.len() > COMPLETION_SUMMARY_MAX_BYTES {
+        return Err(format!(
+            "summary exceeds {} bytes; write the full result to COFFEE_AGENT_RESULTS_DIR and provide result_path",
+            COMPLETION_SUMMARY_MAX_BYTES
+        ));
+    }
+
+    let result_path = match result_path {
+        Some(path) => {
+            let path = path.trim().to_string();
+            if path.is_empty() || path.len() > COMPLETION_PATH_MAX_BYTES {
+                return Err("result_path is empty or too long".to_string());
+            }
+            if path.contains(['\r', '\n']) {
+                return Err("result_path must be a single line".to_string());
+            }
+            let path_buf = std::path::PathBuf::from(&path);
+            if !path_buf.is_absolute() {
+                return Err("result_path must be absolute".to_string());
+            }
+            let metadata = std::fs::metadata(&path_buf)
+                .map_err(|error| format!("result_path is not readable: {error}"))?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                return Err("result_path must reference a non-empty file".to_string());
+            }
+            Some(path)
+        }
+        None => None,
+    };
+
+    Ok((summary, result_path))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct BoundedOutput {
     text: String,
@@ -743,7 +1098,10 @@ fn bounded_output_tail(input: &str, max_lines: usize, max_bytes: usize) -> Bound
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_output_tail, resolve_pane_id, same_tab, tab_prefix};
+    use super::{
+        PaneTaskStatus, TaskCoordinator, bounded_output_tail, resolve_pane_id,
+        same_tab, tab_prefix, validate_completion_payload,
+    };
 
     #[test]
     fn tab_prefix_extracts_tab_portion() {
@@ -813,6 +1171,162 @@ mod tests {
         assert!(output.truncated);
         assert_eq!(output.buffered_bytes, input.len());
     }
+
+    #[test]
+    fn task_lifecycle_is_structured_and_exactly_once() {
+        let tasks = TaskCoordinator::new();
+        let source = "tab-A::pane-1";
+        let target = "tab-A::pane-3";
+        let job_id = tasks.start(source, target).unwrap();
+
+        let running = tasks.latest_for_route(source, target).unwrap();
+        assert_eq!(running.status, PaneTaskStatus::Running);
+        assert!(tasks.start(source, target).unwrap_err().contains("busy"));
+
+        let (completed, is_new) = tasks
+            .complete(target, &job_id, "review complete".to_string(), None)
+            .unwrap();
+        assert!(is_new);
+        assert_eq!(completed.status, PaneTaskStatus::Completed);
+
+        let (_, duplicate_is_new) = tasks
+            .complete(target, &job_id, "ignored duplicate".to_string(), None)
+            .unwrap();
+        assert!(!duplicate_is_new);
+        let stored = tasks.latest_for_route(source, target).unwrap();
+        assert_eq!(stored.summary.as_deref(), Some("review complete"));
+    }
+
+    #[test]
+    fn concurrent_dispatch_reserves_a_target_exactly_once() {
+        let tasks = std::sync::Arc::new(TaskCoordinator::new());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let tasks = tasks.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    tasks.start(
+                        &format!("tab-A::pane-{}", index + 1),
+                        "tab-A::pane-9",
+                    )
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_err()).count(), 7);
+    }
+
+    #[test]
+    fn stale_or_wrong_pane_cannot_complete_a_job() {
+        let tasks = TaskCoordinator::new();
+        let source = "tab-A::pane-1";
+        let target = "tab-A::pane-2";
+        let first = tasks.start(source, target).unwrap();
+        tasks
+            .complete(target, &first, "first".to_string(), None)
+            .unwrap();
+        let second = tasks.start(source, target).unwrap();
+
+        assert!(tasks
+            .complete(target, &first, "late".to_string(), None)
+            .unwrap_err()
+            .contains("stale"));
+        assert!(tasks
+            .complete("tab-A::pane-4", &second, "wrong".to_string(), None)
+            .unwrap_err()
+            .contains("stale"));
+        assert_eq!(
+            tasks.latest_for_route(source, target).unwrap().job_id,
+            second
+        );
+    }
+
+    #[test]
+    fn task_results_are_visible_only_to_the_dispatching_route() {
+        let tasks = TaskCoordinator::new();
+        let source = "tab-A::pane-1";
+        let target = "tab-A::pane-2";
+        let job_id = tasks.start(source, target).unwrap();
+        tasks
+            .complete(target, &job_id, "private result".to_string(), None)
+            .unwrap();
+
+        assert!(tasks.latest_for_route(source, target).is_some());
+        assert!(tasks
+            .latest_for_route("tab-A::pane-3", target)
+            .is_none());
+        assert!(tasks
+            .latest_for_route("tab-B::pane-1", target)
+            .is_none());
+    }
+
+    #[test]
+    fn target_failure_is_stored_and_routes_back_to_dispatcher() {
+        let tasks = TaskCoordinator::new();
+        let source = "tab-A::pane-1";
+        let target = "tab-A::pane-3";
+        let job_id = tasks.start(source, target).unwrap();
+
+        let event = tasks
+            .fail_target(target, "process exited".to_string())
+            .unwrap();
+        assert_eq!(event.job_id, job_id);
+        assert_eq!(event.source_id, target);
+        assert_eq!(event.target_id, source);
+        assert_eq!(event.status, PaneTaskStatus::Failed);
+        assert!(tasks.fail_target(target, "duplicate".to_string()).is_none());
+        assert_eq!(
+            tasks.latest_for_route(source, target).unwrap().status,
+            PaneTaskStatus::Failed
+        );
+    }
+
+    #[test]
+    fn coordinator_prunes_old_terminal_jobs() {
+        let tasks = TaskCoordinator::new();
+        let source = "tab-A::pane-1";
+        let target = "tab-A::pane-2";
+        for index in 0..300 {
+            let job_id = tasks.start(source, target).unwrap();
+            tasks
+                .complete(target, &job_id, format!("result {index}"), None)
+                .unwrap();
+        }
+        assert!(tasks.state.lock().unwrap().records.len() <= 256);
+    }
+
+    #[test]
+    fn completion_payload_requires_real_non_empty_artifact() {
+        let dir = std::env::temp_dir().join(format!(
+            "coffee-cli-completion-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("result.md");
+        std::fs::write(&path, "complete result").unwrap();
+
+        let (_, stored_path) = validate_completion_payload(
+            "summary".to_string(),
+            Some(path.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        assert_eq!(stored_path.as_deref(), path.to_str());
+        assert!(validate_completion_payload("  ".to_string(), None).is_err());
+        assert!(validate_completion_payload(
+            "summary".to_string(),
+            Some(dir.join("missing.md").to_string_lossy().into_owned())
+        )
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 // ---------- MCP server handler ----------
@@ -843,7 +1357,8 @@ impl CoffeeMcp {
 
     #[tool(
         description = "Return the caller's coordinated Coffee-CLI pane identity \
-as `{ pane_id: \"pane-N\" }`. Use that id as the source in [COFFEE-DONE] markers."
+as `{ pane_id: \"pane-N\" }`. Coffee uses this bound identity to authorize \
+dispatch, completion, and reads."
     )]
     async fn whoami(&self) -> Result<CallToolResult, McpError> {
         match &self.self_pane_id {
@@ -891,16 +1406,15 @@ terminated), and is_self. Use this before calling send_to_pane."
     }
 
     #[tool(
-        description = "Dispatch a task to a peer pane and end your own turn. \
-This is fire-and-forget — there is no waiting mode. The call returns \
-immediately, your turn ends, and you sit at idle until the target's \
-`[COFFEE-DONE:pane-2->pane-1]` marker reactivates your LLM with the result. \
+        description = "Dispatch a task to a peer pane. This is fire-and-forget — \
+there is no waiting mode. You may dispatch a small batch of independent tasks \
+to different idle panes; after the final call, end your turn and sit at idle \
+until a target calls \
+`complete_task`, which reactivates your LLM with a structured result. \
 \
-From the target pane's POV the text is indistinguishable from human typing — \
-no special framing, no source flag — and Coffee-CLI auto-prefixes it with \
-`[From pane-N]` so the receiver knows who dispatched it and where to send the \
-DONE marker. A carriage return is auto-appended (set submit=false to disable). \
-Self-dispatch and cross-tab dispatch are rejected."
+Coffee-CLI writes an identity-bound task header and completion contract together \
+with the requested text, then appends a carriage return. Self-dispatch, \
+cross-tab dispatch, and dispatch to a pane with a running job are rejected."
     )]
     async fn send_to_pane(
         &self,
@@ -944,16 +1458,58 @@ Self-dispatch and cross-tab dispatch are rejected."
                 )]));
             }
         }
-        // Multi-agent dispatch is one-shot, period: send and end your
-        // turn. The completion path is a [COFFEE-DONE:pane-2->pane-1]
-        // marker that the target emits, which the frontend converts into
-        // a wake-up message in the caller's PTY. There is no "wait for
-        // idle" mode — keeping the caller's LLM blocked across a multi-
-        // minute peer task wastes context tokens and the user's time.
-        // `timeout_sec` is therefore unused but the underlying helper
-        // still takes it; pass 0 since wait=false ignores it.
+        let Some(source_id) = self.self_pane_id.as_deref() else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({
+                    "status": "failed",
+                    "error": "send_to_pane requires an identity-bound pane endpoint"
+                })
+                .to_string(),
+            )]));
+        };
+
+        if let Err(error) = self.panes.ensure_dispatch_ready(&target_id).await {
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({
+                    "status": "busy",
+                    "pane_id": pane_short(&target_id),
+                    "error": error,
+                    "instruction": "Do not write to or poll this pane. Choose another idle pane or wait until the human-visible task finishes."
+                })
+                .to_string(),
+            )]));
+        }
+
+        // Multi-agent dispatch is one-shot: reserve an identity-bound job
+        // before touching the PTY. This makes concurrent/busy dispatches fail
+        // atomically instead of being merged into a running agent turn.
+        let job_id = match self.panes.tasks.start(source_id, &target_id) {
+            Ok(job_id) => job_id,
+            Err(error) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::json!({
+                        "status": "busy",
+                        "pane_id": pane_short(&target_id),
+                        "error": error,
+                        "instruction": "Do not write to or poll this pane. Choose another idle pane or wait for the existing task's completion notification."
+                    })
+                    .to_string(),
+                )]));
+            }
+        };
+
         let wait = false;
         let submit = args.submit.unwrap_or(true);
+        if !submit {
+            self.panes.tasks.abort_start(&job_id);
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({
+                    "status": "failed",
+                    "error": "submit=false is not supported for coordinated tasks"
+                })
+                .to_string(),
+            )]));
+        }
         let timeout_sec = 0u64;
 
         // Prefix the dispatched text with `[From <self_pane>]` so the
@@ -962,10 +1518,11 @@ Self-dispatch and cross-tab dispatch are rejected."
         // Use the short `pane-N` form (not the long full id) so the
         // resulting prefix doesn't blow up the receiver's terminal
         // width either.
-        let dispatch_text = match &self.self_pane_id {
-            Some(self_id) => format!("[From {}] {}", pane_short(self_id), args.text),
-            None => args.text.clone(),
-        };
+        let dispatch_text = format!(
+            "[Coffee task {job_id} from {}]\n{}\n\nCompletion contract: after the result is ready, call coffee-cli.complete_task with job_id \"{job_id}\", a concise self-contained summary, and an absolute result_path when the full result is stored in a file. Do not print a textual completion marker.",
+            pane_short(source_id),
+            args.text,
+        );
 
         match self
             .panes
@@ -984,10 +1541,8 @@ Self-dispatch and cross-tab dispatch are rejected."
                     "status": status,
                     "pane_id": pane_short(&target_id),
                     "bytes_written": result.bytes_written,
+                    "job_id": job_id,
                 });
-                if !result.waited {
-                    payload["job_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
-                }
                 if let Some(output) = result.captured_output {
                     payload["output"] = serde_json::json!(output);
                 }
@@ -995,20 +1550,87 @@ Self-dispatch and cross-tab dispatch are rejected."
                     serde_json::to_string_pretty(&payload).unwrap_or_default(),
                 )]))
             }
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::json!({ "status": "failed", "error": e }).to_string(),
+            Err(e) => {
+                self.panes.tasks.abort_start(&job_id);
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::json!({ "status": "failed", "error": e }).to_string(),
+                )]))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Complete the coordinated task currently assigned to this pane. \
+Call this exactly once, only after the result is ready. `job_id` must match the \
+Coffee task header. The summary is stored before the dispatching pane is woken, \
+so terminal output and repainting cannot forge or race completion. For long \
+results, first write a non-empty file under COFFEE_AGENT_RESULTS_DIR and pass its \
+absolute path as result_path. After success, end your turn."
+    )]
+    async fn complete_task(
+        &self,
+        Parameters(args): Parameters<CompleteTaskArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(target_id) = self.self_pane_id.as_deref() else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({
+                    "status": "failed",
+                    "error": "complete_task requires an identity-bound pane endpoint"
+                })
+                .to_string(),
+            )]));
+        };
+        let (summary, result_path) = match validate_completion_payload(args.summary, args.result_path) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::json!({ "status": "failed", "error": error }).to_string(),
+                )]));
+            }
+        };
+
+        match self
+            .panes
+            .tasks
+            .complete(target_id, &args.job_id, summary, result_path)
+        {
+            Ok((record, is_new)) => {
+                self.panes.mark_terminal_done(target_id).await;
+                if is_new {
+                    if let Err(error) = self.panes.emit_task_event(&record) {
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            serde_json::json!({
+                                "status": "completed_with_notification_error",
+                                "job_id": record.job_id,
+                                "error": error,
+                                "instruction": "The result is stored. End your turn; the human can recover it with read_pane."
+                            })
+                            .to_string(),
+                        )]));
+                    }
+                }
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::json!({
+                        "status": if is_new { "completed" } else { "already_completed" },
+                        "job_id": record.job_id,
+                        "dispatching_pane": pane_short(&record.source_id),
+                        "instruction": "Completion is recorded. End your turn now."
+                    })
+                    .to_string(),
+                )]))
+            }
+            Err(error) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({ "status": "failed", "error": error }).to_string(),
             )])),
         }
     }
 
     #[tool(
         description = "Read the most recent output lines from another pane. \
-Use only after Coffee-CLI wakes you with a `Task complete` message, or when the \
-human explicitly asks you to inspect a pane. Do not poll progress, sleep, wait, \
-or repeatedly call read_pane after send_to_pane; end your turn and let the DONE \
-notification reactivate you. Returns bounded plain text plus is_idle, truncated, \
-buffered_bytes, and returned_bytes. When truncated is true, read the complete \
-artifact path reported by the peer instead of treating output as complete."
+Use after Coffee-CLI wakes you with a `Task complete` message. Coordinated jobs \
+return the structured summary/result_path stored by complete_task; terminal output \
+is used only as a fallback when the human explicitly asks you to inspect a pane. \
+Never poll progress, sleep, wait, or repeatedly call read_pane after send_to_pane."
     )]
     async fn read_pane(
         &self,
@@ -1034,6 +1656,50 @@ artifact path reported by the peer instead of treating output as complete."
             .last_n_lines
             .unwrap_or(READ_PANE_DEFAULT_LINES)
             .clamp(1, READ_PANE_MAX_LINES);
+
+        if let Some(source_id) = self.self_pane_id.as_deref() {
+            if let Some(record) = self.panes.tasks.latest_for_route(source_id, &target_id) {
+                let payload = match record.status {
+                    PaneTaskStatus::Running => serde_json::json!({
+                        "status": "working",
+                        "job_id": record.job_id,
+                        "pane_id": pane_short(&target_id),
+                        "output": "",
+                        "is_idle": false,
+                        "instruction": "End your turn now. Do not sleep, wait, or poll read_pane. Coffee-CLI will reactivate you when complete_task stores the result."
+                    }),
+                    PaneTaskStatus::Completed => {
+                        let mut output = record.summary.clone().unwrap_or_default();
+                        if let Some(path) = &record.result_path {
+                            output.push_str("\n\nFull result: ");
+                            output.push_str(path);
+                        }
+                        serde_json::json!({
+                            "status": "completed",
+                            "job_id": record.job_id,
+                            "pane_id": pane_short(&target_id),
+                            "summary": record.summary,
+                            "result_path": record.result_path,
+                            "output": output,
+                            "is_idle": true,
+                            "truncated": false,
+                        })
+                    }
+                    PaneTaskStatus::Failed => serde_json::json!({
+                        "status": record.status,
+                        "job_id": record.job_id,
+                        "pane_id": pane_short(&target_id),
+                        "error": record.error,
+                        "output": "",
+                        "is_idle": true,
+                    }),
+                };
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                )]));
+            }
+        }
+
         match self.panes.read(&target_id, last_n).await {
             Ok((output, is_idle)) => {
                 let payload = if is_idle {
@@ -1060,7 +1726,7 @@ artifact path reported by the peer instead of treating output as complete."
                         "status": "working",
                         "output": "",
                         "is_idle": false,
-                        "instruction": "End your turn now. Do not sleep, wait, or poll read_pane. Coffee-CLI will reactivate you when this pane emits DONE."
+                        "instruction": "End your turn now. Do not sleep, wait, or poll read_pane."
                     })
                 };
                 Ok(CallToolResult::success(vec![Content::text(
@@ -1084,10 +1750,12 @@ impl ServerHandler for CoffeeMcp {
             server_info: Implementation::from_build_env(),
             instructions: Some(
                 "Coffee-CLI multi-agent MCP server. \
-Tools: whoami, list_panes, send_to_pane, read_pane. \
+Tools: whoami, list_panes, send_to_pane, complete_task, read_pane. \
 Use these to coordinate ACROSS different CLIs (Claude/Codex/OpenCode). \
-After send_to_pane, end the turn immediately. Never poll, sleep, or wait for a peer; \
-the DONE notification will reactivate the caller. Read peer output only after that notification. \
+You may send a small batch to different idle panes; after the final send_to_pane, \
+end the turn immediately. Never poll, sleep, or wait for a peer; \
+the structured completion notification will reactivate the caller. A receiving pane must call \
+complete_task exactly once after its result is ready. Read peer output only after notification. \
 For intra-CLI parallelism, prefer your native subagent SDK (Agent Teams / app-server / TaskTool). \
 The caller's system prompt contains the full coordination protocol."
                     .to_string(),
@@ -1164,7 +1832,7 @@ async fn mcp_request_middleware(
 /// instance: every tool call to it is treated as coming from that pane.
 /// Pass `None` for an "anonymous" server (legacy / non-multi-agent),
 /// or `Some(pane_id)` to make `whoami()`, `is_self` in `list_panes`,
-/// and `[From <id>]` prefixing in `send_to_pane` all work without the
+/// and identity-bound `send_to_pane` jobs all work without the
 /// LLM needing to guess.
 pub async fn spawn(
     panes: Arc<PaneStore>,
@@ -1175,7 +1843,7 @@ pub async fn spawn(
 
 /// Like `spawn`, but lets the caller request a specific port.
 ///
-/// `preferred_port = 0` falls back to OS-assigned (the per-pane sentinel
+/// `preferred_port = 0` falls back to OS-assigned (the per-pane coordination
 /// servers want this — they're transient and ephemeral by design).
 ///
 /// If the preferred port is busy we silently fall back to OS-assigned

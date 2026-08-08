@@ -9,6 +9,10 @@ use tauri_plugin_dialog::DialogExt;
 /// Shared app state
 pub struct AppState {
     pub terminal_session: terminal::SharedSession,
+    /// Structured multi-agent jobs shared by every per-pane MCP endpoint.
+    /// Task state lives here rather than in terminal output so a pane's text
+    /// cannot forge completion and results survive PTY repainting.
+    pub multi_agent_tasks: std::sync::Arc<crate::mcp_server::TaskCoordinator>,
     /// Active OS fs watcher (one per app instance). Some(...) while a
     /// workspace folder is open; None otherwise. Swapping this Mutex'd
     /// Option replaces the watcher atomically on folder switch.
@@ -21,7 +25,7 @@ pub struct AppState {
     /// Per-pane MCP server endpoints. Each multi-agent pane (Claude /
     /// Codex / OpenCode) gets its OWN HTTP listener on its own port with
     /// `self_pane_id` baked in, so `whoami()` / `is_self` in
-    /// `list_panes` / `[From <id>]` prefixing in `send_to_pane` all
+    /// `list_panes` / identity-bound jobs in `send_to_pane` all
     /// behave deterministically regardless of which CLI is calling.
     /// Map is keyed by pane id (= terminal session id like
     /// "tab-X::pane-2"). Closing a pane aborts its listener and removes
@@ -657,9 +661,9 @@ fn copy_dir_all(src: &std::path::Path, dest: &std::path::Path) -> std::io::Resul
 
 // ─── Tier Terminal API ────────────────────────────────────────────────────────
 
-/// Multi-agent panes always receive peer-awareness MCP wiring. Sentinel is
-/// a separate frontend completion-marker feature and must never determine
-/// whether an agent can discover or address its sibling panes.
+/// Multi-agent panes always receive peer-awareness MCP wiring. The per-pane
+/// notification toggle never determines whether an agent can discover or
+/// address its sibling panes.
 #[tauri::command]
 async fn tier_terminal_start(
     session_id: String,
@@ -698,7 +702,7 @@ async fn tier_terminal_start(
             _ => None,
         };
         if let Some(kind) = pane_cli_kind {
-            let endpoint = ensure_pane_mcp_running(&state, &session_id).await?;
+            let endpoint = ensure_pane_mcp_running(&state, &session_id, app.clone()).await?;
             let protocol = crate::multi_agent_protocol::build_pane_system_prompt(&session_id);
             match crate::mcp_injector::prepare_pane_config_dir(
                 &session_id,
@@ -825,9 +829,9 @@ fn tier_terminal_start_blocking(
                 match id {
                     "claude" => {
                         // Let the agent use tools without human approval.
-                        // MCP's list_panes / send_to_pane / read_pane /
-                        // whoami give it pane discovery, dispatch, and
-                        // self-identification.
+                        // MCP's whoami / list_panes / send_to_pane /
+                        // complete_task / read_pane give it identity-bound
+                        // discovery, dispatch, completion, and result reads.
                         a.push("--dangerously-skip-permissions".to_string());
                         // Per-pane MCP config: this Claude session points
                         // at its OWN MCP server (with `self_pane_id`
@@ -1151,45 +1155,79 @@ fn tier_terminal_input(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     // Grab the writer handle while holding the map lock (cheap clone, no I/O).
-    let writer_arc = {
+    let (writer_arc, activity_arc) = {
         let map = state.terminal_session.lock().unwrap();
         match map.get(&session_id) {
-            Some(s) => s.writer_lock.clone(),
+            Some(session) => (session.writer_lock.clone(), session.activity.clone()),
             None => return Err(format!("No active terminal session for id: {}", session_id)),
         }
     };
     // Map lock released — other tabs can now proceed concurrently
 
+    // Reserve the pane as busy before the PTY write. This closes the small
+    // race where a peer dispatch could otherwise pass its readiness check
+    // after Enter was pressed but before the submitted prompt reached the CLI.
+    if data.contains('\r') || data.contains('\n') {
+        if let Ok(mut activity) = activity_arc.lock() {
+            activity.mark_working();
+            if activity.native_status.is_some() {
+                activity.native_status = Some("working".to_string());
+            }
+        }
+    }
+
     // PTY write may block under back-pressure, after the session-map lock has
     // already been released so other tabs remain responsive.
     use std::io::Write;
-    let mut w = writer_arc.lock().map_err(|e| format!("Writer lock poisoned: {}", e))?;
-    w.write_all(data.as_bytes()).map_err(|e| format!("Write failed: {}", e))?;
+    let mut w = writer_arc
+        .lock()
+        .map_err(|e| format!("Writer lock poisoned: {}", e))?;
+    w.write_all(data.as_bytes())
+        .map_err(|e| format!("Write failed: {}", e))?;
     w.flush().map_err(|e| format!("Flush failed: {}", e))?;
 
     Ok(())
 }
 
-/// Commit a Sentinel DONE receipt before the frontend wakes the requesting
-/// pane. This makes completion authoritative for MCP read_pane instead of
-/// relying on output-silence heuristics that can lag behind the receipt.
+/// Mirror authoritative native CLI title status into the backend so MCP
+/// dispatch can reject a pane that is already handling human-entered work.
 #[tauri::command]
-fn tier_terminal_mark_done(
+fn tier_terminal_agent_status(
     session_id: String,
+    status: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if !matches!(status.as_str(), "idle" | "working" | "wait_input") {
+        return Err(format!("invalid agent status: {status}"));
+    }
     let activity = {
         let map = state.terminal_session.lock().unwrap();
         match map.get(&session_id) {
-            Some(s) => s.activity.clone(),
-            None => return Err(format!("No active terminal session for id: {}", session_id)),
+            Some(session) => session.activity.clone(),
+            None => return Err(format!("No active terminal session for id: {session_id}")),
         }
     };
-
     let mut activity = activity
         .lock()
-        .map_err(|e| format!("Activity lock poisoned: {}", e))?;
-    activity.mark_done();
+        .map_err(|error| format!("Activity lock poisoned: {error}"))?;
+    activity.native_status = Some(status);
+    Ok(())
+}
+
+/// Convert an actual peer process exit into a structured failed task. The
+/// frontend calls this from the authoritative child-watcher event; duplicate
+/// exit/status notifications are harmless because fail_target is idempotent.
+#[tauri::command]
+fn tier_terminal_fail_task(
+    session_id: String,
+    reason: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if let Some(event) = state.multi_agent_tasks.fail_target(&session_id, reason) {
+        app.emit("multi-agent-task-complete", event)
+            .map_err(|error| format!("task failure event emit failed: {error}"))?;
+    }
     Ok(())
 }
 
@@ -1246,7 +1284,17 @@ fn set_session_active(session_id: String, active: bool, state: State<'_, AppStat
 }
 
 #[tauri::command]
-async fn tier_terminal_kill(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn tier_terminal_kill(
+    session_id: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if let Some(event) = state
+        .multi_agent_tasks
+        .fail_target(&session_id, "peer pane was stopped".to_string())
+    {
+        let _ = app.emit("multi-agent-task-complete", event);
+    }
     let kill_tx = {
         let map = state.terminal_session.lock().unwrap();
         map.get(&session_id).map(|session| session.kill_tx.clone())
@@ -4042,13 +4090,14 @@ async fn cleanup_pane_mcp(state: &AppState, pane_id: &str) {
 /// pane gets a unique MCP endpoint with its own identity baked in:
 /// every call to its `whoami()` returns the same `pane_id`,
 /// `list_panes` marks the matching row `is_self: true`, and
-/// `send_to_pane` prefixes dispatched text with `[From <pane_id>]`.
+/// `send_to_pane` creates identity-bound jobs sourced from this pane.
 ///
 /// Uses `mcp_spawn_lock` to serialize concurrent first-callers for
 /// the same pane id so we never bind two listeners.
 pub async fn ensure_pane_mcp_running(
     state: &AppState,
     pane_id: &str,
+    app: tauri::AppHandle,
 ) -> Result<crate::mcp_server::McpEndpoint, String> {
     // Fast path — already spawned for this pane.
     {
@@ -4068,7 +4117,11 @@ pub async fn ensure_pane_mcp_running(
     }
 
     let panes = std::sync::Arc::new(
-        crate::mcp_server::PaneStore::new(state.terminal_session.clone()),
+        crate::mcp_server::PaneStore::new(
+            state.terminal_session.clone(),
+            state.multi_agent_tasks.clone(),
+            app,
+        ),
     );
     let endpoint = crate::mcp_server::spawn(panes, Some(pane_id.to_string()))
         .await
@@ -4187,6 +4240,9 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
             terminal_session,
+            multi_agent_tasks: std::sync::Arc::new(
+                crate::mcp_server::TaskCoordinator::new(),
+            ),
             fs_watcher: Mutex::new(None),
             pending_launch: Mutex::new(pending_launch),
             pane_mcp_endpoints: tokio::sync::Mutex::new(
@@ -4204,7 +4260,8 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
             set_frosted_backdrop,
             tier_terminal_start,
             tier_terminal_input,
-            tier_terminal_mark_done,
+            tier_terminal_agent_status,
+            tier_terminal_fail_task,
             tier_terminal_raw_write,
             tier_terminal_kill,
             tier_terminal_resize,

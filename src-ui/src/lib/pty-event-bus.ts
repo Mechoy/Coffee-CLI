@@ -24,11 +24,19 @@ interface OutputEventPayload { id: string; data: string; }
 interface StatusEventPayload { id: string; running: boolean; exit_code: number | null; }
 interface CwdEventPayload { id: string; cwd: string; }
 interface ExitEventPayload { id: string; exit_code: number; }
+export interface PeerTaskEventPayload {
+  job_id: string;
+  source_id: string;
+  target_id: string;
+  status: 'completed' | 'failed';
+  error?: string;
+}
 
 type OutputHandler = (data: string) => void;
 type StatusHandler = (running: boolean, exitCode: number | null) => void;
 type CwdHandler = (cwd: string) => void;
 type ExitHandler = (exitCode: number) => void;
+type PeerTaskHandler = (event: PeerTaskEventPayload) => void;
 
 interface TerminalEventHandlers {
   onOutput?: OutputHandler;
@@ -39,12 +47,41 @@ interface TerminalEventHandlers {
    *  after the reader thread sees EOF — onExit may arrive earlier, and with
    *  the real exit code instead of the hardcoded 0 in the status event. */
   onExit?: ExitHandler;
+  /** Structured peer completion routed by target pane id. Unlike terminal
+   *  output, this event is emitted only after Rust stores the task result. */
+  onPeerTask?: PeerTaskHandler;
 }
 
 const outputHandlers = new Map<string, OutputHandler>();
 const statusHandlers = new Map<string, StatusHandler>();
 const cwdHandlers = new Map<string, CwdHandler>();
 const exitHandlers = new Map<string, ExitHandler>();
+const peerTaskHandlers = new Map<string, PeerTaskHandler>();
+// Completion is control data, so a short component remount must not drop it.
+// Keep one copy per job until the destination pane registers again. Rust also
+// stores the full result; this cache only preserves the wake-up notification.
+const pendingPeerTasks = new Map<string, Map<string, PeerTaskEventPayload>>();
+const MAX_PENDING_PEER_TASKS_PER_PANE = 64;
+const MAX_PENDING_PEER_TASK_PANES = 32;
+
+function retainPeerTask(event: PeerTaskEventPayload): void {
+  let pending = pendingPeerTasks.get(event.target_id);
+  if (!pending) {
+    while (pendingPeerTasks.size >= MAX_PENDING_PEER_TASK_PANES) {
+      const oldestPane = pendingPeerTasks.keys().next().value;
+      if (!oldestPane) break;
+      pendingPeerTasks.delete(oldestPane);
+    }
+    pending = new Map();
+    pendingPeerTasks.set(event.target_id, pending);
+  }
+  pending.set(event.job_id, event);
+  while (pending.size > MAX_PENDING_PEER_TASKS_PER_PANE) {
+    const oldest = pending.keys().next().value;
+    if (!oldest) break;
+    pending.delete(oldest);
+  }
+}
 
 let globalUnlisteners: UnlistenFn[] | null = null;
 let initPromise: Promise<void> | null = null;
@@ -70,7 +107,15 @@ async function ensureInit(): Promise<void> {
       const handler = exitHandlers.get(event.payload.id);
       if (handler) handler(event.payload.exit_code);
     });
-    globalUnlisteners = [unOutput, unStatus, unCwd, unExit];
+    const unPeerTask = await listen<PeerTaskEventPayload>('multi-agent-task-complete', (event) => {
+      const handler = peerTaskHandlers.get(event.payload.target_id);
+      if (handler) {
+        handler(event.payload);
+      } else {
+        retainPeerTask(event.payload);
+      }
+    });
+    globalUnlisteners = [unOutput, unStatus, unCwd, unExit, unPeerTask];
   })();
 
   return initPromise;
@@ -96,11 +141,20 @@ export async function subscribeTerminalEvents(
   const myStatus = handlers.onStatus;
   const myCwd = handlers.onCwd;
   const myExit = handlers.onExit;
+  const myPeerTask = handlers.onPeerTask;
 
   if (myOutput) outputHandlers.set(sessionId, myOutput);
   if (myStatus) statusHandlers.set(sessionId, myStatus);
   if (myCwd) cwdHandlers.set(sessionId, myCwd);
   if (myExit) exitHandlers.set(sessionId, myExit);
+  if (myPeerTask) {
+    peerTaskHandlers.set(sessionId, myPeerTask);
+    const pending = pendingPeerTasks.get(sessionId);
+    if (pending) {
+      pendingPeerTasks.delete(sessionId);
+      for (const event of pending.values()) myPeerTask(event);
+    }
+  }
 
   return () => {
     // Only delete if the registered handler is still ours.
@@ -111,5 +165,6 @@ export async function subscribeTerminalEvents(
     if (myStatus && statusHandlers.get(sessionId) === myStatus) statusHandlers.delete(sessionId);
     if (myCwd && cwdHandlers.get(sessionId) === myCwd) cwdHandlers.delete(sessionId);
     if (myExit && exitHandlers.get(sessionId) === myExit) exitHandlers.delete(sessionId);
+    if (myPeerTask && peerTaskHandlers.get(sessionId) === myPeerTask) peerTaskHandlers.delete(sessionId);
   };
 }

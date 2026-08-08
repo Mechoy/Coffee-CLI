@@ -105,7 +105,7 @@ export function unregisterSession(id: string): void {
 /** Route a PTY output chunk. Foreground → write immediately; background →
  *  buffer (2MB lossy). Called from TierTerminal's onOutput handler INSTEAD OF
  *  `term.write(data)` — all other per-chunk tracking (hasOutput, alt-screen,
- *  sentinel scan) stays in the handler and runs synchronously before this. */
+ *  SSH password detection) stays in the handler and runs synchronously before this. */
 export function enqueue(id: string, data: string): void {
   const q = sessions.get(id);
   if (!q) return;
