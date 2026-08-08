@@ -18,6 +18,7 @@
 //! | Codex    | `-c mcp_servers.coffee-cli.url='<url>'`                    | command-line override (no file)                           |
 //! |          | `-c model_instructions_file='<pane-temp>/inst.md'`         | per-pane temp file (no workspace touch)                   |
 //! | OpenCode | `OPENCODE_CONFIG_CONTENT=<merged-json>` env var            | highest-priority inline config with MCP and instructions  |
+//! | All      | `COFFEE_AGENT_RESULTS_DIR=<pane-temp>/results` env var      | temporary complete-result handoff                         |
 //!
 //! Antigravity CLI (replaced Gemini CLI 2026-05-19) is NOT in the table:
 //! its plugin model is `agy plugin install <name>` (persistent registry)
@@ -64,6 +65,10 @@ pub struct PaneConfigPaths {
     /// last, so project config cannot replace this pane's endpoint. Any
     /// inherited inline config is structurally preserved.
     pub opencode_config_content: Option<String>,
+    /// Temporary directory for complete cross-pane results that are too long
+    /// for the bounded `read_pane` terminal view. Passed to every supported
+    /// pane as `COFFEE_AGENT_RESULTS_DIR` and removed with pane artifacts.
+    pub result_dir: Option<PathBuf>,
 }
 
 /// Build per-pane CLI artifacts for `pane_id` running `cli_kind`,
@@ -85,6 +90,11 @@ pub fn prepare_pane_config_dir(
     fs::create_dir_all(&dir)?;
 
     let mut out = PaneConfigPaths::default();
+    if matches!(cli_kind, "claude" | "codex" | "opencode") {
+        let result_dir = dir.join("results");
+        fs::create_dir_all(&result_dir)?;
+        out.result_dir = Some(result_dir);
+    }
     match cli_kind {
         "claude" => {
             let p = dir.join("claude-mcp.json");
@@ -309,6 +319,7 @@ mod tests {
         let body = fs::read_to_string(&p).unwrap();
         assert!(body.contains("coffee-cli"));
         assert!(body.contains("http://127.0.0.1:50000/mcp"));
+        assert!(out.result_dir.as_ref().is_some_and(|dir| dir.is_dir()));
         let _ = fs::remove_dir_all(panes_root().join(sanitize_pane_id(&pid)));
     }
 
@@ -323,6 +334,7 @@ mod tests {
         assert!(out.codex_extra_args[1].contains("http://127.0.0.1:50000/mcp"));
         assert_eq!(out.codex_extra_args[2], "-c");
         assert!(out.codex_extra_args[3].contains("model_instructions_file"));
+        assert!(out.result_dir.as_ref().is_some_and(|dir| dir.is_dir()));
         // Protocol text actually got written.
         let inst_path = panes_root()
             .join(sanitize_pane_id(&pid))
@@ -402,6 +414,7 @@ mod tests {
         assert!(out.claude_mcp_config_path.is_none());
         assert!(out.codex_extra_args.is_empty());
         assert!(out.opencode_config_content.is_none());
+        assert!(out.result_dir.is_none());
         let _ = fs::remove_dir_all(panes_root().join(sanitize_pane_id(&pid)));
     }
 }

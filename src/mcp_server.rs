@@ -199,10 +199,9 @@ impl PaneStore {
     /// also marks the pane as `"working"`; the wait loop changes it back to
     /// `"wait_input"` after the response settles.
     ///
-    /// Output capture works by diffing `output_buffer` snapshots taken
-    /// before the write vs. after idle detection. The ring can drain
-    /// (capped by chunk count and total bytes in `terminal.rs`); in that case we
-    /// fall back to returning the current tail rather than failing.
+    /// Output capture is task-scoped: the MCP-only buffer is cleared before
+    /// the write, then read after idle detection. Terminal rendering and the
+    /// CLI's own session history are independent and remain untouched.
     async fn dispatch(
         &self,
         id: &str,
@@ -223,12 +222,14 @@ impl PaneStore {
         let should_submit = submit;
         let bytes_written = body.len() + if should_submit { 1 } else { 0 };
 
-        // Phase 1a: snapshot buffer + write BODY (no Enter yet).
-        let buf_before = {
+        // Phase 1a: start a task-scoped capture + write BODY (no Enter yet).
+        // read_pane is a result handoff, so retaining older peer tasks only
+        // creates ambiguity and makes truncation metadata stale.
+        {
             let id2 = id.to_string();
             let body2 = body.clone();
             let session = self.session.clone();
-            tokio::task::spawn_blocking(move || -> Result<String, String> {
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
                 let (writer_arc, buffer_arc) = {
                     let guard = session
                         .lock()
@@ -239,12 +240,12 @@ impl PaneStore {
                     (sess.writer_lock.clone(), sess.output_buffer.clone())
                 };
 
-                let before = {
-                    let ring = buffer_arc
+                {
+                    let mut ring = buffer_arc
                         .lock()
                         .map_err(|_| "output buffer poisoned".to_string())?;
-                    ring.joined()
-                };
+                    ring.clear();
+                }
 
                 {
                     let mut writer = writer_arc
@@ -260,7 +261,7 @@ impl PaneStore {
                     }
                 }
 
-                Ok(before)
+                Ok(())
             })
             .await
             .map_err(|e| format!("blocking task join failed: {}", e))??
@@ -480,7 +481,7 @@ impl PaneStore {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        // Phase 3: snapshot buffer after idle and extract the new suffix.
+        // Phase 3: snapshot the task-scoped buffer after idle.
         let buf_after = {
             let id2 = id.to_string();
             let session = self.session.clone();
@@ -501,18 +502,11 @@ impl PaneStore {
             .map_err(|e| format!("blocking task join failed: {}", e))??
         };
 
-        let raw_diff = if buf_after.starts_with(&buf_before) {
-            buf_after[buf_before.len()..].to_string()
-        } else {
-            // Ring was drained between snapshots — best effort, return all.
-            buf_after
-        };
-
-        let stripped = self.ansi_re.replace_all(&raw_diff, "").to_string();
+        let stripped = self.ansi_re.replace_all(&buf_after, "").to_string();
 
         // Keep the dormant legacy wait-mode path safe if it is ever exposed
         // again: carriage-return redraws require a byte cap, not just lines.
-        let trimmed = bounded_output_tail(&stripped, 200, READ_PANE_MAX_BYTES);
+        let trimmed = bounded_output_tail(&stripped, 200, READ_PANE_MAX_BYTES).text;
 
         Ok(DispatchResult {
             bytes_written,
@@ -524,12 +518,12 @@ impl PaneStore {
 
     /// Return the last `last_n` lines of the pane's ANSI-stripped output,
     /// plus an `is_idle` flag derived from `last_status`.
-    async fn read(&self, id: &str, last_n: usize) -> Result<(String, bool), String> {
+    async fn read(&self, id: &str, last_n: usize) -> Result<(BoundedOutput, bool), String> {
         let id = id.to_string();
         let session = self.session.clone();
         let ansi_re = self.ansi_re.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<(String, bool), String> {
+        tokio::task::spawn_blocking(move || -> Result<(BoundedOutput, bool), String> {
             let guard = session
                 .lock()
                 .map_err(|_| "session map poisoned".to_string())?;
@@ -538,12 +532,12 @@ impl PaneStore {
                 .ok_or_else(|| format!("pane not found: {}", id))?;
 
             // Pull the raw output tail under its own lock, dropped immediately.
-            let joined = {
+            let (joined, buffer_truncated) = {
                 let ring = sess
                     .output_buffer
                     .lock()
                     .map_err(|_| "output buffer poisoned".to_string())?;
-                ring.joined()
+                (ring.joined(), ring.prefix_truncated())
             };
 
             // Silence is not completion: a CLI can spend minutes waiting for
@@ -561,7 +555,8 @@ impl PaneStore {
             // spinners frequently repaint with bare carriage returns, which
             // can produce one enormous logical line and bypass a line-only cap.
             let stripped = ansi_re.replace_all(&joined, "").to_string();
-            let output = bounded_output_tail(&stripped, last_n, READ_PANE_MAX_BYTES);
+            let mut output = bounded_output_tail(&stripped, last_n, READ_PANE_MAX_BYTES);
+            output.truncated |= buffer_truncated;
             Ok((output, is_idle))
         })
         .await
@@ -695,30 +690,55 @@ fn same_tab(left: &str, right: &str) -> bool {
     tab_prefix(left) == tab_prefix(right)
 }
 
-fn bounded_output_tail(input: &str, max_lines: usize, max_bytes: usize) -> String {
+#[derive(Debug, PartialEq, Eq)]
+struct BoundedOutput {
+    text: String,
+    truncated: bool,
+    buffered_bytes: usize,
+}
+
+fn bounded_output_tail(input: &str, max_lines: usize, max_bytes: usize) -> BoundedOutput {
+    let buffered_bytes = input.len();
     if max_bytes == 0 {
-        return String::new();
+        return BoundedOutput {
+            text: String::new(),
+            truncated: !input.is_empty(),
+            buffered_bytes,
+        };
     }
 
     let mut lines: Vec<&str> = input.lines().collect();
+    let lines_truncated = lines.len() > max_lines;
     if lines.len() > max_lines {
         lines = lines.split_off(lines.len() - max_lines);
     }
     let by_lines = lines.join("\n");
     if by_lines.len() <= max_bytes {
-        return by_lines;
+        return BoundedOutput {
+            text: by_lines,
+            truncated: lines_truncated,
+            buffered_bytes,
+        };
     }
 
     const MARKER: &str = "[... earlier terminal output truncated ...]\n";
     if max_bytes <= MARKER.len() {
-        return MARKER[..max_bytes].to_string();
+        return BoundedOutput {
+            text: MARKER[..max_bytes].to_string(),
+            truncated: true,
+            buffered_bytes,
+        };
     }
     let tail_budget = max_bytes.saturating_sub(MARKER.len());
     let mut start = by_lines.len().saturating_sub(tail_budget);
     while start < by_lines.len() && !by_lines.is_char_boundary(start) {
         start += 1;
     }
-    format!("{MARKER}{}", &by_lines[start..])
+    BoundedOutput {
+        text: format!("{MARKER}{}", &by_lines[start..]),
+        truncated: true,
+        buffered_bytes,
+    }
 }
 
 #[cfg(test)]
@@ -769,16 +789,29 @@ mod tests {
 
     #[test]
     fn output_tail_keeps_only_requested_lines() {
-        assert_eq!(bounded_output_tail("one\ntwo\nthree", 2, 1024), "two\nthree");
+        let output = bounded_output_tail("one\ntwo\nthree", 2, 1024);
+        assert_eq!(output.text, "two\nthree");
+        assert!(output.truncated);
+        assert_eq!(output.buffered_bytes, 13);
+    }
+
+    #[test]
+    fn output_tail_reports_complete_small_output() {
+        let output = bounded_output_tail("one\ntwo", 80, 1024);
+        assert_eq!(output.text, "one\ntwo");
+        assert!(!output.truncated);
+        assert_eq!(output.buffered_bytes, 7);
     }
 
     #[test]
     fn output_tail_caps_single_long_line_without_splitting_utf8() {
         let input = format!("{}咖啡", "x".repeat(4096));
         let output = bounded_output_tail(&input, 200, 128);
-        assert!(output.len() <= 128);
-        assert!(output.starts_with("[... earlier terminal output truncated ...]"));
-        assert!(output.ends_with("咖啡"));
+        assert!(output.text.len() <= 128);
+        assert!(output.text.starts_with("[... earlier terminal output truncated ...]"));
+        assert!(output.text.ends_with("咖啡"));
+        assert!(output.truncated);
+        assert_eq!(output.buffered_bytes, input.len());
     }
 }
 
@@ -973,7 +1006,9 @@ Self-dispatch and cross-tab dispatch are rejected."
 Use only after Coffee-CLI wakes you with a `Task complete` message, or when the \
 human explicitly asks you to inspect a pane. Do not poll progress, sleep, wait, \
 or repeatedly call read_pane after send_to_pane; end your turn and let the DONE \
-notification reactivate you. Returns bounded plain text and an is_idle flag."
+notification reactivate you. Returns bounded plain text plus is_idle, truncated, \
+buffered_bytes, and returned_bytes. When truncated is true, read the complete \
+artifact path reported by the peer instead of treating output as complete."
     )]
     async fn read_pane(
         &self,
@@ -1002,11 +1037,21 @@ notification reactivate you. Returns bounded plain text and an is_idle flag."
         match self.panes.read(&target_id, last_n).await {
             Ok((output, is_idle)) => {
                 let payload = if is_idle {
-                    serde_json::json!({
+                    let returned_bytes = output.text.len();
+                    let mut payload = serde_json::json!({
                         "status": "idle",
-                        "output": output,
+                        "output": output.text,
                         "is_idle": true,
-                    })
+                        "truncated": output.truncated,
+                        "buffered_bytes": output.buffered_bytes,
+                        "returned_bytes": returned_bytes,
+                    });
+                    if output.truncated {
+                        payload["instruction"] = serde_json::json!(
+                            "This terminal view is incomplete. Use the `Full result: <absolute-path>` shown near the end to read the peer's complete artifact. If no path is present, ask the peer to save and report the complete result."
+                        );
+                    }
+                    payload
                 } else {
                     // A busy pane can contain thousands of spinner redraws.
                     // Returning none of them is also a runtime guard against

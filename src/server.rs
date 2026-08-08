@@ -1093,13 +1093,23 @@ fn tier_terminal_start_blocking(
 
     // Per-pane env overrides. OpenCode loads OPENCODE_CONFIG_CONTENT last,
     // after project config, so its pane-specific endpoint cannot be replaced.
-    // Other CLIs leave this empty.
+    // Every supported multi-agent CLI also receives a private temporary
+    // directory for long result artifacts that cannot fit in read_pane.
     let mut extra_env: Vec<(String, String)> = Vec::new();
     if let Some(content) = pane_paths
         .as_ref()
         .and_then(|pp| pp.opencode_config_content.as_ref())
     {
         extra_env.push(("OPENCODE_CONFIG_CONTENT".to_string(), content.clone()));
+    }
+    if let Some(result_dir) = pane_paths
+        .as_ref()
+        .and_then(|pp| pp.result_dir.as_ref())
+    {
+        extra_env.push((
+            "COFFEE_AGENT_RESULTS_DIR".to_string(),
+            result_dir.to_string_lossy().to_string(),
+        ));
     }
 
     terminal::spawn(

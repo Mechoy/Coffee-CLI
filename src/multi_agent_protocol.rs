@@ -82,6 +82,27 @@ target in your DONE marker.
 
 ## DONE marker (when you are the receiver)
 
+### Long result handoff
+
+`read_pane` transfers at most 200 recent lines and 32 KiB. Your own session
+history remains complete, but the dispatcher cannot reliably receive a long
+terminal report through that tool.
+
+If your complete result may exceed about 100 lines, contains substantial code
+or logs, or must not lose its beginning:
+
+1. Write the complete result to a uniquely named file inside the directory in
+   `COFFEE_AGENT_RESULTS_DIR`. Resolve and report the absolute path, not the
+   literal environment-variable expression. Do not write temporary handoff
+   files into the user's repository.
+2. In the terminal, output only a concise self-contained summary plus
+   `Full result: <absolute-path>`.
+3. Emit the DONE marker only after the file has been flushed successfully.
+
+The result directory is temporary and is removed when its pane or Coffee-CLI
+closes. If the user requested a durable deliverable, write it to the explicit
+workspace path they requested instead and report that path.
+
 When you finish a task that a peer dispatched to you, emit on its
 own line as the final output of your turn:
 
@@ -111,4 +132,19 @@ sits idle indefinitely.
 "#,
         pane_short = pane_short,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_pane_system_prompt;
+
+    #[test]
+    fn prompt_teaches_bounded_handoff_and_complete_artifacts() {
+        let prompt = build_pane_system_prompt("tab-test::pane-2");
+        assert!(prompt.contains("Your pane is\n`pane-2`"));
+        assert!(prompt.contains("at most 200 recent lines and 32 KiB"));
+        assert!(prompt.contains("COFFEE_AGENT_RESULTS_DIR"));
+        assert!(prompt.contains("Full result: <absolute-path>"));
+        assert!(prompt.contains("DONE marker only after the file has been flushed"));
+    }
 }

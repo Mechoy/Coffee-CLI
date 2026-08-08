@@ -470,6 +470,7 @@ pub struct SessionActivity {
 pub struct TerminalOutputBuffer {
     chunks: std::collections::VecDeque<String>,
     bytes: usize,
+    prefix_truncated: bool,
 }
 
 impl TerminalOutputBuffer {
@@ -483,11 +484,13 @@ impl TerminalOutputBuffer {
         Self {
             chunks: std::collections::VecDeque::new(),
             bytes: 0,
+            prefix_truncated: false,
         }
     }
 
     fn push(&mut self, mut data: String) {
         if data.len() > Self::MAX_BYTES {
+            self.prefix_truncated = true;
             let mut start = data.len() - Self::MAX_BYTES;
             while !data.is_char_boundary(start) {
                 start += 1;
@@ -499,6 +502,7 @@ impl TerminalOutputBuffer {
         self.chunks.push_back(data);
         while self.chunks.len() > Self::MAX_CHUNKS || self.bytes > Self::MAX_BYTES {
             if let Some(removed) = self.chunks.pop_front() {
+                self.prefix_truncated = true;
                 self.bytes = self.bytes.saturating_sub(removed.len());
             } else {
                 break;
@@ -512,6 +516,16 @@ impl TerminalOutputBuffer {
             output.push_str(chunk);
         }
         output
+    }
+
+    pub fn prefix_truncated(&self) -> bool {
+        self.prefix_truncated
+    }
+
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.bytes = 0;
+        self.prefix_truncated = false;
     }
 }
 
@@ -1301,6 +1315,7 @@ mod tests {
         }
         assert_eq!(buffer.chunks.len(), TerminalOutputBuffer::MAX_CHUNKS);
         assert_eq!(buffer.joined().len(), TerminalOutputBuffer::MAX_CHUNKS);
+        assert!(buffer.prefix_truncated());
     }
 
     #[test]
@@ -1311,6 +1326,19 @@ mod tests {
         let output = buffer.joined();
         assert!(output.len() <= TerminalOutputBuffer::MAX_BYTES);
         assert!(output.ends_with("咖啡"));
+        assert!(buffer.prefix_truncated());
+    }
+
+    #[test]
+    fn output_buffer_clear_resets_task_truncation() {
+        let mut buffer = TerminalOutputBuffer::new();
+        buffer.push("x".repeat(TerminalOutputBuffer::MAX_BYTES + 1));
+        assert!(buffer.prefix_truncated());
+
+        buffer.clear();
+        buffer.push("next task".to_string());
+        assert_eq!(buffer.joined(), "next task");
+        assert!(!buffer.prefix_truncated());
     }
 
     // ── find_preset ───────────────────────────────────────────────────────────
