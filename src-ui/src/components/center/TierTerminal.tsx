@@ -424,13 +424,6 @@ interface TierTerminalProps {
   bgType?: 'image' | 'video' | 'none';
   termColorScheme?: string;
   termFont?: string;
-  /** Multi-agent only. When true, the backend wires this pane's
-   *  `coffee-cli` MCP server + injects the cross-pane protocol prompt
-   *  into the CLI's system instructions. When false (default), the
-   *  pane runs hands-free but with NO peer awareness — it shares only
-   *  the workspace folder with sibling panes. Ignored outside
-   *  multi-agent grids (single-terminal tabs always pass false). */
-  sentinelEnabled?: boolean;
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
@@ -495,6 +488,7 @@ function TierTerminalImpl({
   // scanner in `onData` below for the consume/advance logic.
   const markerScanBufRef = useRef<string>('');
   const markerScanOffsetRef = useRef<number>(0);
+  const recentDoneMarkersRef = useRef<Map<string, number>>(new Map());
 
   // ── Stale-frame ghost suppression on tab switch (issue #47) ──────────────
   // Inactive tabs are display:none (CenterPanel). While hidden, xterm's WebGL
@@ -1213,11 +1207,11 @@ function TierTerminalImpl({
           // failure responses. What this scanner handles is the BACKWARD
           // completion receipt:
           //
-          //   [COFFEE-DONE:paneN->paneM]
+          //   [COFFEE-DONE:pane-N->pane-M]
           //     pane N has finished a task and wants to notify pane M.
-          //     Gated by sentinelEnabled on BOTH panes (opt-in): with
+          //     Gated by sentinelEnabled on BOTH panes (default-on): with
           //     sentinel on, the frontend lights a green dot on pane N's
-          //     badge AND injects "[From pane N] Task complete." + Enter
+          //     badge AND injects "[From pane-N] Task complete." + Enter
           //     into pane M's PTY input, which wakes pane M's LLM turn
           //     loop without polling. With sentinel off, the marker sits
           //     inert in pane N's scrollback and the user has to eyeball
@@ -1265,23 +1259,42 @@ function TierTerminalImpl({
             const paneIdMatch = sessionId.match(/^(.+)::pane-(\d+)$/);
             if (paneIdMatch) {
               const tabId = paneIdMatch[1];
+              const sourcePaneIdx = parseInt(paneIdMatch[2], 10);
               const tab = appStateRef.current.terminals.find(t => t.id === tabId);
               const panes = tab?.multiAgent?.panes ?? [];
               let advancedTo = 0;
 
               // DONE: backward receipt, sentinel-gated on the emitter side.
-              const doneRegex = /\[COFFEE-DONE:pane(\d+)->pane(\d+)\]/g;
+              // Canonical pane ids include a hyphen (`pane-2`). Accept the
+              // pre-v3.3 legacy spelling (`pane2`) as well so an older prompt
+              // already loaded in a running agent can still wake its peer.
+              const doneRegex = /\[COFFEE-DONE:pane-?(\d+)->pane-?(\d+)\]/g;
               let doneM: RegExpExecArray | null;
               while ((doneM = doneRegex.exec(unscanned)) !== null) {
                 const emitter = parseInt(doneM[1], 10);
                 const target = parseInt(doneM[2], 10);
+                advancedTo = Math.max(advancedTo, doneM.index + doneM[0].length);
+
+                // Trust the terminal session identity, not text embedded in
+                // its output. A pane cannot claim another pane completed.
+                if (emitter !== sourcePaneIdx) continue;
+
+                // Full-screen TUIs can repaint the same final line. Suppress
+                // rapid duplicate wake-ups without blocking a later task on
+                // the same pane route.
+                const markerKey = `${emitter}->${target}`;
+                const now = Date.now();
+                const lastSeen = recentDoneMarkersRef.current.get(markerKey) ?? 0;
+                if (now - lastSeen < 2000) continue;
+                recentDoneMarkersRef.current.set(markerKey, now);
+
                 const emitterPane = panes.find(p => p.paneIdx === emitter);
-                if (emitterPane?.sentinelEnabled) {
+                if (emitterPane && emitterPane.sentinelEnabled !== false) {
                   dispatch({ type: 'SET_PANE_COMPLETION', tabId, paneIdx: emitter, ts: Date.now() });
                   const targetPane = panes.find(p => p.paneIdx === target);
-                  if (targetPane?.sentinelEnabled && targetPane.tool !== null && target !== emitter) {
+                  if (targetPane && targetPane.sentinelEnabled !== false && targetPane.tool !== null && target !== emitter) {
                     const targetId = `${tabId}::pane-${target}`;
-                    const notify = `[From pane ${emitter}] Task complete.`;
+                    const notify = `[From pane-${emitter}] Task complete.`;
                     // `paste()` (see registerTabActions below) handles the
                     // trailing CR — it schedules `\r` 30ms after the paste
                     // so the TUI treats it as Enter rather than part of
@@ -1289,7 +1302,6 @@ function TierTerminalImpl({
                     getTabActions(targetId)?.paste(notify);
                   }
                 }
-                advancedTo = Math.max(advancedTo, doneM.index + doneM[0].length);
               }
 
               if (advancedTo > 0) {
@@ -2104,8 +2116,8 @@ function TierTerminalImpl({
 // regression was almost certainly fixed by a later commit and memo was a false
 // attribution. Using no-arg memo (shallow-compares ALL props) instead of the
 // original custom comparator, which was incomplete — it only checked 7 props
-// and missed resumeToken/hasBg/bgUrl/bgType/termColorScheme/termFont/
-// sentinelEnabled, so those prop changes would have wrongly skipped a
+// and missed resumeToken/hasBg/bgUrl/bgType/termColorScheme/termFont, so
+// those prop changes would have wrongly skipped a
 // re-render. If the launch regression recurs in dev (StrictMode double-invoke),
 // revert this; Phase 1-3 do not depend on memo.
 export const TierTerminal = memo(TierTerminalImpl);

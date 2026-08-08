@@ -17,7 +17,7 @@
 // text can't be misdirected to the wrong terminal.
 
 import { useCallback, useEffect } from 'react';
-import { useAppState, isSplitTool, paneSessionId, matchHotkeyScheme } from '../../store/app-state';
+import { useAppState, isMultiAgentTool, isSplitTool, paneSessionId, matchHotkeyScheme } from '../../store/app-state';
 import { getTabActions } from '../../lib/tab-actions';
 import { getFocusedPane } from '../../lib/pane-focus';
 import { Gambit } from './Gambit';
@@ -68,6 +68,10 @@ export function ActiveGambit() {
       const paneIdx = getFocusedPane(activeId);
       if (!paneIdx) return false;
       targetId = paneSessionId(activeId, paneIdx, 'split');
+    } else if (isMultiAgentTool(tool)) {
+      const paneIdx = getFocusedPane(activeId);
+      if (!paneIdx) return false;
+      targetId = paneSessionId(activeId, paneIdx, 'pane');
     }
     const actions = getTabActions(targetId);
     if (!actions) return false;

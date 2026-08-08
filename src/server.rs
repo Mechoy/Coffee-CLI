@@ -18,6 +18,21 @@ pub struct AppState {
     /// warm-start requests skip this slot and arrive as `launch-request`
     /// events from the single-instance callback instead (see launch.rs).
     pub pending_launch: Mutex<Option<crate::launch::LaunchRequest>>,
+    /// Per-pane MCP server endpoints. Each multi-agent pane (Claude /
+    /// Codex / OpenCode) gets its OWN HTTP listener on its own port with
+    /// `self_pane_id` baked in, so `whoami()` / `is_self` in
+    /// `list_panes` / `[From <id>]` prefixing in `send_to_pane` all
+    /// behave deterministically regardless of which CLI is calling.
+    /// Map is keyed by pane id (= terminal session id like
+    /// "tab-X::pane-2"). Closing a pane aborts its listener and removes
+    /// the entry.
+    pub pane_mcp_endpoints: tokio::sync::Mutex<
+        std::collections::HashMap<String, crate::mcp_server::McpEndpoint>,
+    >,
+    /// Async lock around any MCP-server spawn path. Held only while
+    /// a (one-time) spawn is in flight so concurrent first-callers
+    /// don't race and bind two listeners for the same pane.
+    pub mcp_spawn_lock: tokio::sync::Mutex<()>,
 }
 
 
@@ -170,10 +185,7 @@ async fn pick_folder(app: tauri::AppHandle) -> Result<String, String> {
 
 // ─── Tool Availability Detection ─────────────────────────────────────────────
 
-/// PATH lookup wrapper. Used by hook_installer + agent_mcp_config to
-/// gate config-file writes so we don't materialize stray `~/.codex/`,
-/// `~/.config/opencode/`, etc. on machines where the user hasn't
-/// installed the upstream CLI yet.
+/// PATH lookup wrapper used by tool detection and integration maintenance.
 pub(crate) fn binary_on_path(bin: &str) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -645,6 +657,9 @@ fn copy_dir_all(src: &std::path::Path, dest: &std::path::Path) -> std::io::Resul
 
 // ─── Tier Terminal API ────────────────────────────────────────────────────────
 
+/// Multi-agent panes always receive peer-awareness MCP wiring. Sentinel is
+/// a separate frontend completion-marker feature and must never determine
+/// whether an agent can discover or address its sibling panes.
 #[tauri::command]
 async fn tier_terminal_start(
     session_id: String,
@@ -660,6 +675,49 @@ async fn tier_terminal_start(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // ── Per-pane MCP wiring for multi-agent panes ────────────────────
+    // For each multi-agent pane (session id like "tab-X::pane-N")
+    // running Claude, Codex, or OpenCode, spawn an MCP server with that
+    // pane's identity baked in and prepare per-pane CLI artifacts:
+    //   - Claude:   `--mcp-config <pane>/claude-mcp.json` + `--append-system-prompt`
+    //   - Codex:    `-c mcp_servers.coffee-cli.url='...'` + `-c model_instructions_file='<pane>/inst.md'`
+    //   - OpenCode: `OPENCODE_CONFIG_CONTENT=<merged-json>` env var
+    // Across all three, `whoami()` returns the deterministic pane id,
+    // `list_panes()` marks `is_self: true` on the matching row, and
+    // dispatched text auto-prefixes with `[From <pane>]`. No global
+    // config injection, no workspace files written, no env var that
+    // would redirect the CLI's HOME and break auth.
+    //
+    // Other tools stay unwired and are not offered by MultiAgentGrid.
+    let mut pane_paths: Option<crate::mcp_injector::PaneConfigPaths> = None;
+    {
+        let in_multi_agent = session_id.contains("::pane-");
+        let pane_cli_kind = match tool.as_deref() {
+            Some(k @ ("claude" | "codex" | "opencode"))
+                if in_multi_agent => Some(k),
+            _ => None,
+        };
+        if let Some(kind) = pane_cli_kind {
+            let endpoint = ensure_pane_mcp_running(&state, &session_id).await?;
+            let protocol = crate::multi_agent_protocol::build_pane_system_prompt(&session_id);
+            match crate::mcp_injector::prepare_pane_config_dir(
+                &session_id,
+                kind,
+                &endpoint,
+                &protocol,
+            ) {
+                Ok(paths) => pane_paths = Some(paths),
+                Err(e) => {
+                    cleanup_pane_mcp(&state, &session_id).await;
+                    return Err(format!(
+                        "multi-agent config for {} ({}) failed: {}",
+                        session_id, kind, e
+                    ));
+                }
+            }
+        }
+    }
+
     // Offload the whole spawn sequence to a blocking thread so the Tauri
     // command dispatcher returns immediately. Without this, Windows was
     // paying ~cmd.exe boot + Defender AV scan + Node startup on the command
@@ -667,14 +725,27 @@ async fn tier_terminal_start(
     // until the spawn returned. Running in the terminal directly avoids
     // this because no IPC layer is involved — the shell forks directly.
     let terminal_session = state.terminal_session.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let cleanup_session_id = session_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         tier_terminal_start_blocking(
             session_id, tool, tool_data, cols, rows,
-            theme_mode, locale, cwd, resume_token, shell, app, terminal_session,
+            theme_mode, locale, cwd, resume_token, shell, app,
+            terminal_session, pane_paths,
         )
     })
-    .await
-    .map_err(|e| format!("Spawn task join failed: {e}"))?
+    .await;
+    match result {
+        Ok(inner) => {
+            if inner.is_err() {
+                cleanup_pane_mcp(&state, &cleanup_session_id).await;
+            }
+            inner
+        }
+        Err(e) => {
+            cleanup_pane_mcp(&state, &cleanup_session_id).await;
+            Err(format!("Spawn task join failed: {e}"))
+        }
+    }
 }
 
 fn tier_terminal_start_blocking(
@@ -690,6 +761,7 @@ fn tier_terminal_start_blocking(
     shell: Option<String>,
     app: tauri::AppHandle,
     terminal_session: terminal::SharedSession,
+    pane_paths: Option<crate::mcp_injector::PaneConfigPaths>,
 ) -> Result<(), String> {
     // CWD resolution order (first non-empty wins):
     //   1. cwd passed from the frontend (launchpad's folder picker / per-tab cwd)
@@ -715,17 +787,120 @@ fn tier_terminal_start_blocking(
         std::path::PathBuf::default()
     };
 
-    // Resolve the binary + default args from the tool registry. `remote`
-    // and the fallback shell are not in the registry — `remote` parses
-    // tool_data at runtime, the shell is platform-derived.
+    // ── Multi-agent auto-approval ────────────────────────────────────────
+    // Multi-agent pane session ids look like `${tabId}::pane-N`. When a
+    // CLI spawns in such a pane it is being orchestrated by *another* CLI
+    // via send_to_pane; a human isn't going to be there to click "Yes" on
+    // every tool-use confirmation, so we boot each primary CLI with its
+    // "skip permissions" flag so the full multi-agent workflow runs
+    // hands-free. Claude may still show its own first-run acknowledgement
+    // before accepting the skip-permissions flag.
+    //
+    // Independent-split pane ids use the `::split-N` prefix instead
+    // (FourSplitGrid). Those panes are NOT orchestrated — the user is
+    // watching each pane and approves tool calls themselves — and the
+    // MCP injector has NOT run, so passing `--dangerously-skip-permissions`
+    // to Claude there would hit the un-pre-accepted warning screen and
+    // kill the process. Keep the flag off for split panes.
+    //
+    // This is a deliberate trust tradeoff: entering multi-agent mode
+    // delegates authority to the controlling pane's LLM. Users who want
+    // per-tool supervision should use independent split or single-terminal
+    // mode.
+    let in_multi_agent = session_id.contains("::pane-");
+
+    // Multi-agent flag sets (claude / codex) carry per-pane MCP wiring
+    // that depends on `pane_paths` and `session_id`, so they live
+    // inline. `remote` and the fallback shell are not in the registry —
+    // `remote` parses tool_data at runtime, the shell is platform-derived.
     let registry_descriptor = tool.as_deref().and_then(crate::tools::find);
     let (cmd, args): (String, Vec<String>) = match (tool.as_deref(), registry_descriptor) {
-        (Some(_id), Some(descriptor)) => {
-            let a: Vec<String> = descriptor
+        (Some(id), Some(descriptor)) => {
+            let mut a: Vec<String> = descriptor
                 .default_args
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
+            if in_multi_agent {
+                match id {
+                    "claude" => {
+                        // Let the agent use tools without human approval.
+                        // MCP's list_panes / send_to_pane / read_pane /
+                        // whoami give it pane discovery, dispatch, and
+                        // self-identification.
+                        a.push("--dangerously-skip-permissions".to_string());
+                        // Per-pane MCP config: this Claude session points
+                        // at its OWN MCP server (with `self_pane_id`
+                        // baked in) so `whoami()` returns deterministic
+                        // answers and `list_panes()` marks `is_self:
+                        // true` on the matching row. Claude merges this
+                        // on top of any user-managed `~/.claude.json`
+                        // mcpServers entries.
+                        if let Some(p) = pane_paths
+                            .as_ref()
+                            .and_then(|pp| pp.claude_mcp_config_path.as_ref())
+                        {
+                            a.push("--mcp-config".to_string());
+                            a.push(p.display().to_string());
+                            // Per-pane system prompt: bake the pane id
+                            // and protocol cheat sheet into THIS Claude
+                            // session's system prompt. Survives /clear
+                            // and /compact. Replaces writing CLAUDE.md
+                            // to the workspace, so multi-agent Claude
+                            // users see ZERO files appear in their
+                            // project directory. It is paired with the MCP
+                            // config above so the prompt only describes
+                            // tools that are actually wired into the pane.
+                            a.push("--append-system-prompt".to_string());
+                            a.push(crate::multi_agent_protocol::build_pane_system_prompt(
+                                &session_id,
+                            ));
+                        }
+                    }
+                    "codex" => {
+                        // Hands-free multi-agent: no human is present to
+                        // click through confirmation dialogs (the
+                        // originating pane's LLM dispatched this work
+                        // via send_to_pane). The earlier conservative
+                        // `-s workspace-write -a never` combo still
+                        // surfaced sandbox-violation prompts for
+                        // cross-workspace ops, login/trust dialogs, and
+                        // first-run consent screens that block the
+                        // PTY. Codex's own "skip everything" door is
+                        // `--dangerously-bypass-approvals-and-sandbox` —
+                        // the doc explicitly reads "Skip all
+                        // confirmation prompts and execute commands
+                        // without sandboxing." That's the right
+                        // tradeoff for multi-agent mode: entering it
+                        // already delegates trust to the controlling
+                        // pane's LLM.
+                        a.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+                        // Per-pane MCP wiring via Codex's `-c
+                        // key=value` config override (it merges onto
+                        // `~/.codex/config.toml` rather than replacing
+                        // it, so user MCP entries / API keys / auth all
+                        // stay live). Two pairs:
+                        //   `mcp_servers.coffee-cli.url='<per-pane-url>'`
+                        //   `model_instructions_file='<pane-temp>/inst.md'`
+                        // The instructions file holds the multi-agent
+                        // protocol body (same text Claude gets via
+                        // --append-system-prompt) and Codex bakes it
+                        // into the model's session context. Both the
+                        // URL and instructions path are unique per
+                        // pane, so 4× same-CLI panes still get
+                        // distinct identity.
+                        if let Some(extra) =
+                            pane_paths.as_ref().map(|pp| pp.codex_extra_args.clone())
+                        {
+                            a.extend(extra);
+                        }
+                    }
+                    // Other registered tools have no multi-agent flag
+                    // set today — they spawn with default_args inside
+                    // a multi-agent pane just like outside one.
+                    _ => {}
+                }
+            }
             (descriptor.binary_name.to_string(), a)
         }
         (Some("remote"), _) => {
@@ -916,9 +1091,16 @@ fn tier_terminal_start_blocking(
 
     eprintln!("[Tier Terminal] Starting tool={:?}, cmd={}, args={:?}, cwd={:?}", tool, cmd, args, spawn_cwd);
 
-    // Per-pane env overrides (reserved). Independent-split and
-    // single-terminal panes spawn with no extra env today.
-    let extra_env: Vec<(String, String)> = Vec::new();
+    // Per-pane env overrides. OpenCode loads OPENCODE_CONFIG_CONTENT last,
+    // after project config, so its pane-specific endpoint cannot be replaced.
+    // Other CLIs leave this empty.
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    if let Some(content) = pane_paths
+        .as_ref()
+        .and_then(|pp| pp.opencode_config_content.as_ref())
+    {
+        extra_env.push(("OPENCODE_CONFIG_CONTENT".to_string(), content.clone()));
+    }
 
     terminal::spawn(
         app.clone(),
@@ -1031,11 +1213,15 @@ fn set_session_active(session_id: String, active: bool, state: State<'_, AppStat
 }
 
 #[tauri::command]
-fn tier_terminal_kill(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let map = state.terminal_session.lock().unwrap();
-    if let Some(session) = map.get(&session_id) {
-        let _ = session.kill_tx.send(());
+async fn tier_terminal_kill(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let kill_tx = {
+        let map = state.terminal_session.lock().unwrap();
+        map.get(&session_id).map(|session| session.kill_tx.clone())
+    };
+    if let Some(kill_tx) = kill_tx {
+        let _ = kill_tx.send(());
     }
+    cleanup_pane_mcp(&state, &session_id).await;
     Ok(())
 }
 
@@ -3778,16 +3964,6 @@ fn run_self_update(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ─── Hyper-Agent: global anonymous MCP server for external orchestrators ──
-//
-// Started lazily when the user opens the Hyper-Agent tab. `self_pane_id=None`,
-// so list_panes / send_to_pane bypass tab-scope filtering — exactly the
-// "super admin can see and dispatch to every pane" semantics the product
-// needs. Uses a port persisted across launches so OpenClaw / Hermes Agent
-// configs stay stable (no config-file thrash → no gateway restart loops).
-//
-// Tauri commands here are all the frontend needs to know about.
-
 // ─── Per-tool launch overrides (~/.coffee-cli/tools.json) ────────────────
 //
 // Lets users tell Coffee CLI things like "my claude is at
@@ -3814,7 +3990,128 @@ pub fn set_tool_config(
     crate::tool_config::set(&tool, entry).map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+pub struct MultiAgentModeReport {
+    pub ok: bool,
+    pub warnings: Vec<String>,
+}
+
+async fn cleanup_pane_mcp(state: &AppState, pane_id: &str) {
+    if let Some(endpoint) = state.pane_mcp_endpoints.lock().await.remove(pane_id) {
+        endpoint.shutdown();
+    }
+    crate::mcp_injector::remove_pane_artifacts(pane_id);
+}
+
+/// Lazy-spawn a PER-PANE MCP server bound to a specific pane id, on
+/// its own dedicated port. Idempotent — if a server already exists
+/// for `pane_id`, returns it. This is how a multi-agent Claude Code
+/// pane gets a unique MCP endpoint with its own identity baked in:
+/// every call to its `whoami()` returns the same `pane_id`,
+/// `list_panes` marks the matching row `is_self: true`, and
+/// `send_to_pane` prefixes dispatched text with `[From <pane_id>]`.
+///
+/// Uses `mcp_spawn_lock` to serialize concurrent first-callers for
+/// the same pane id so we never bind two listeners.
+pub async fn ensure_pane_mcp_running(
+    state: &AppState,
+    pane_id: &str,
+) -> Result<crate::mcp_server::McpEndpoint, String> {
+    // Fast path — already spawned for this pane.
+    {
+        let guard = state.pane_mcp_endpoints.lock().await;
+        if let Some(ep) = guard.get(pane_id) {
+            return Ok(ep.clone());
+        }
+    }
+
+    // Slow path — take the global spawn lock, double-check, then bind.
+    let _spawn_guard = state.mcp_spawn_lock.lock().await;
+    {
+        let guard = state.pane_mcp_endpoints.lock().await;
+        if let Some(ep) = guard.get(pane_id) {
+            return Ok(ep.clone());
+        }
+    }
+
+    let panes = std::sync::Arc::new(
+        crate::mcp_server::PaneStore::new(state.terminal_session.clone()),
+    );
+    let endpoint = crate::mcp_server::spawn(panes, Some(pane_id.to_string()))
+        .await
+        .map_err(|e| format!("mcp spawn for {}: {}", pane_id, e))?;
+    log::info!(
+        "[mcp] per-pane server up at {} (pane={})",
+        endpoint.url, pane_id
+    );
+
+    state
+        .pane_mcp_endpoints
+        .lock()
+        .await
+        .insert(pane_id.to_string(), endpoint.clone());
+    Ok(endpoint)
+}
+
+/// Enable multi-agent mode for the given workspace.
+///
+/// Post-v1.5 this is a thin handshake — per-pane MCP servers and
+/// per-pane CLI artifacts (Claude `mcp.json` / Codex `instructions.md`
+/// / OpenCode `instructions.md`) are all created lazily inside
+/// `tier_terminal_start` when each pane spawns its CLI. No workspace
+/// files are written, no global `~/.codex` `mcp_servers` blocks get
+/// injected, no env var redirects the CLI's HOME (so auth stays live).
+///
+/// The frontend still calls this on tab mount as a structured place
+/// for cross-cutting validation (workspace must exist, future license
+/// gating, etc.) — kept around for that hook, not because it does any
+/// heavy lifting today.
+///
+/// `_tools` and `_state` are kept in the signature for API
+/// compatibility with the existing TS `commands.enableMultiAgentMode`
+/// invocation; they're unused here.
+#[tauri::command]
+async fn enable_multi_agent_mode(
+    workspace: String,
+    _tools: Vec<String>,
+    _state: tauri::State<'_, AppState>,
+) -> Result<MultiAgentModeReport, String> {
+    let ws = PathBuf::from(&workspace);
+    if !ws.is_dir() {
+        return Err(format!("workspace is not a directory: {}", workspace));
+    }
+    Ok(MultiAgentModeReport {
+        ok: true,
+        warnings: Vec::new(),
+    })
+}
+
+/// Disable multi-agent mode for the given workspace.
+///
+/// Post-v1.5 this is a no-op for the workspace itself — multi-agent
+/// mode no longer writes any workspace files or global config entries
+/// to clean up here. Each pane's MCP server and temp artifacts are
+/// removed by `tier_terminal_kill`; crash residue under
+/// `<temp>/coffee-cli/panes/` is pruned at the next launch.
+///
+/// `_workspace` is kept in the signature for API compat with the TS
+/// caller in `MultiAgentGrid.tsx`'s unmount cleanup.
+#[tauri::command]
+fn disable_multi_agent_mode(
+    _workspace: String,
+) -> Result<MultiAgentModeReport, String> {
+    Ok(MultiAgentModeReport {
+        ok: true,
+        warnings: Vec::new(),
+    })
+}
+
 pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow::Result<()> {
+    // Drop the previous run's per-pane artifacts before we boot —
+    // `<temp>/coffee-cli/panes/*` from a crashed or hard-killed prior
+    // session would otherwise accumulate. New artifacts are recreated
+    // lazily by `tier_terminal_start` as multi-agent panes spawn.
+    crate::mcp_injector::prune_pane_artifacts();
     // Create shared session BEFORE the builder so we can clone it for the exit handler
     let terminal_session = terminal::SharedSession::default();
 
@@ -3859,6 +4156,10 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
             terminal_session,
             fs_watcher: Mutex::new(None),
             pending_launch: Mutex::new(pending_launch),
+            pane_mcp_endpoints: tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            ),
+            mcp_spawn_lock: tokio::sync::Mutex::new(()),
         })
         .invoke_handler(tauri::generate_handler![
             crate::fonts::list_system_fonts,
@@ -3904,6 +4205,8 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
             delete_password,
             open_url,
             download_and_install_update,
+            enable_multi_agent_mode,
+            disable_multi_agent_mode,
             get_tool_config,
             get_all_tool_configs,
             set_tool_config,
@@ -4063,6 +4366,13 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
                 }
             }
         });
+
+    // App has fully exited. Per-pane MCP servers and their temp
+    // artifacts get GC'd by the OS along with the process, but be
+    // explicit about pruning so a long-running dev workstation never
+    // accumulates stale dirs even if the next launch never happens.
+    // Symmetric with the launch-time prune — belt-and-suspenders.
+    crate::mcp_injector::prune_pane_artifacts();
 
     Ok(())
 }

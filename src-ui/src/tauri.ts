@@ -277,6 +277,11 @@ export const commands = {
   stopFsWatcher: () =>
     invoke<void>('stop_fs_watcher'),
 
+  enableMultiAgentMode: (workspace: string, tools: string[]) =>
+    invoke<{ ok: boolean; warnings: string[] }>('enable_multi_agent_mode', { workspace, tools }),
+  disableMultiAgentMode: (workspace: string) =>
+    invoke<{ ok: boolean; warnings: string[] }>('disable_multi_agent_mode', { workspace }),
+
   // ─── Per-tool launch overrides (~/.coffee-cli/tools.json) ───────────
   getToolConfig: (tool: string) =>
     invoke<ToolConfigEntry>('get_tool_config', { tool }),

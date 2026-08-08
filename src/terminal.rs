@@ -439,6 +439,10 @@ pub struct TerminalSession {
     pub session_token: Mutex<Option<String>>,
     /// Hold PTY master alive — dropping this kills the terminal pipe
     pub(crate) _master: Arc<Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>,
+    /// Lightweight activity state used by the multi-agent MCP bridge. UI tab
+    /// status still comes from each CLI's native terminal-title integration;
+    /// this state only tracks whether an MCP-dispatched task is in flight.
+    pub activity: Arc<Mutex<SessionActivity>>,
     /// True when this session's terminal is actually on-screen — its tab is
     /// the active center-panel tab, or (for split panes) its parent tab is
     /// active. Flipped by `set_session_active`, called from a frontend
@@ -452,16 +456,61 @@ pub struct TerminalSession {
     /// confirmed. The observer fires within a frame or two for a genuinely
     /// visible tab, so the visible-tab throttled window is tiny.
     pub is_tab_active: Arc<AtomicBool>,
-    /// Ring buffer of recent base64-encoded output chunks. Originally
-    /// populated for DetachedTerminal's history replay (retired 2026-04)
-    /// and the MCP `read_pane` tool (also archived). Currently referenced
-    /// only by the dormant `mcp_server` module; kept alive here so that
-    /// module still compiles and can be revived without re-plumbing.
-    #[allow(dead_code)] // intentionally unread in the active build (see above)
-    pub output_buffer: Arc<Mutex<Vec<String>>>,
+    /// Recent terminal output used by the MCP `read_pane` tool.
+    pub output_buffer: Arc<Mutex<TerminalOutputBuffer>>,
 }
 
 pub type SharedSession = Arc<Mutex<std::collections::HashMap<String, TerminalSession>>>;
+
+pub struct SessionActivity {
+    pub last_output_at: Instant,
+    pub last_status: String,
+}
+
+pub struct TerminalOutputBuffer {
+    chunks: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+impl TerminalOutputBuffer {
+    const MAX_CHUNKS: usize = 2000;
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+
+    fn new() -> Self {
+        Self {
+            chunks: std::collections::VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    fn push(&mut self, mut data: String) {
+        if data.len() > Self::MAX_BYTES {
+            let mut start = data.len() - Self::MAX_BYTES;
+            while !data.is_char_boundary(start) {
+                start += 1;
+            }
+            data = data[start..].to_string();
+        }
+
+        self.bytes += data.len();
+        self.chunks.push_back(data);
+        while self.chunks.len() > Self::MAX_CHUNKS || self.bytes > Self::MAX_BYTES {
+            if let Some(removed) = self.chunks.pop_front() {
+                self.bytes = self.bytes.saturating_sub(removed.len());
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn joined(&self) -> String {
+        let mut output = String::with_capacity(self.bytes);
+        for chunk in &self.chunks {
+            output.push_str(chunk);
+        }
+        output
+    }
+}
 
 // ─── Spawn ────────────────────────────────────────────────
 
@@ -471,7 +520,7 @@ pub type SharedSession = Arc<Mutex<std::collections::HashMap<String, TerminalSes
 /// `extra_env` is applied AFTER parent-env inheritance and the standard
 /// AI-CLI env hints (TERM/FORCE_COLOR/NODE_OPTIONS/…) so its entries win.
 /// Used for per-pane config injection where the env var must differ across
-/// concurrent panes (e.g. `OPENCODE_CONFIG` points at a per-pane JSON file).
+/// concurrent panes (e.g. `OPENCODE_CONFIG_CONTENT` carries per-pane JSON).
 /// `std::env::set_var` would race across panes; this is the race-free path.
 pub fn spawn(
     app: AppHandle,
@@ -715,7 +764,7 @@ pub fn spawn(
     // Applied last so they win over inherited parent env, the AI-CLI hint
     // block, theme/locale, and OSC 7 PROMPT_COMMAND. The race-free path for
     // per-pane config when multiple panes spawn concurrently — each gets its
-    // own env block (e.g. OPENCODE_CONFIG=<unique-pane-temp-path>) without
+    // own env block (e.g. OPENCODE_CONFIG_CONTENT=<per-pane-json>) without
     // mutating Coffee CLI's own process-wide env.
     for (k, v) in &extra_env {
         cmd.env(k, v);
@@ -837,11 +886,17 @@ pub fn spawn(
     // `TerminalSession::is_tab_active`.
     let is_tab_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
+    let activity = Arc::new(Mutex::new(SessionActivity {
+        last_output_at: Instant::now() - std::time::Duration::from_secs(2),
+        last_status: "wait_input".to_string(),
+    }));
+
     // Store session with shared writer reference and master kept alive.
-    let output_buffer: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let output_buffer = Arc::new(Mutex::new(TerminalOutputBuffer::new()));
     {
         let writer_clone = writer.clone();
         let master_clone = master_arc.clone();
+        let activity_clone = activity.clone();
         let buffer_clone = output_buffer.clone();
         let mut map = session.lock().unwrap();
         map.insert(
@@ -852,6 +907,7 @@ pub fn spawn(
                 tool_name: tool_name.clone(),
                 session_token: Mutex::new(None),
                 _master: master_clone,
+                activity: activity_clone,
                 output_buffer: buffer_clone,
                 is_tab_active: is_tab_active.clone(),
             },
@@ -942,6 +998,7 @@ pub fn spawn(
     // ── Emitter thread ──────────────────────────────────────────────────────
     let app_out = app.clone();
     let session_id_out = session_id.clone();
+    let activity_for_emitter = activity.clone();
     let output_buffer_for_emitter = output_buffer.clone();
     let is_active_for_emitter = is_tab_active.clone();
 
@@ -1042,6 +1099,12 @@ pub fn spawn(
                 let data = String::from_utf8_lossy(&pending[..valid_end]).to_string();
                 let stripped = ansi_re.replace_all(&data, "").to_string();
 
+                if !stripped.is_empty() {
+                    if let Ok(mut activity) = activity_for_emitter.lock() {
+                        activity.last_output_at = Instant::now();
+                    }
+                }
+
                 // Session token capture (once per session, for `--resume`).
                 if !token_captured {
                     if let Some(ref re) = session_id_regex {
@@ -1075,13 +1138,9 @@ pub fn spawn(
                     },
                 );
 
-                // One entry per batch in the detached-window history ring.
+                // Keep only the recent tail needed by MCP read_pane.
                 if let Ok(mut ring) = output_buffer_for_emitter.lock() {
                     ring.push(data);
-                    if ring.len() > 2000 {
-                        let drain = ring.len() - 2000;
-                        ring.drain(..drain);
-                    }
                 }
 
                 if let Some(new_cwd) = cwd_change {
@@ -1229,6 +1288,26 @@ mod tests {
             extract_osc7_cwd(&data),
             Some("/C:/Users/foo/project".to_string())
         );
+    }
+
+    #[test]
+    fn output_buffer_caps_chunk_count() {
+        let mut buffer = TerminalOutputBuffer::new();
+        for _ in 0..=TerminalOutputBuffer::MAX_CHUNKS {
+            buffer.push("x".to_string());
+        }
+        assert_eq!(buffer.chunks.len(), TerminalOutputBuffer::MAX_CHUNKS);
+        assert_eq!(buffer.joined().len(), TerminalOutputBuffer::MAX_CHUNKS);
+    }
+
+    #[test]
+    fn output_buffer_caps_bytes_without_splitting_utf8() {
+        let mut buffer = TerminalOutputBuffer::new();
+        let oversized = format!("{}咖啡", "x".repeat(TerminalOutputBuffer::MAX_BYTES));
+        buffer.push(oversized);
+        let output = buffer.joined();
+        assert!(output.len() <= TerminalOutputBuffer::MAX_BYTES);
+        assert!(output.ends_with("咖啡"));
     }
 
     // ── find_preset ───────────────────────────────────────────────────────────

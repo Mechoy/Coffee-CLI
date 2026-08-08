@@ -5,7 +5,7 @@ import type { ReactNode } from 'react';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export type ToolType = 'claude' | 'qwen' | 'installer' | 'hermes' | 'opencode' | 'mimocode' | 'openclaw' | 'codex' | 'grok' | 'antigravity' | 'pi' | 'crush' | 'aider' | 'kimicode' | 'goose' | 'copilot' | 'terminal' | 'remote' | 'two-split' | 'three-split' | 'four-split' | null;
+export type ToolType = 'claude' | 'qwen' | 'installer' | 'hermes' | 'opencode' | 'mimocode' | 'openclaw' | 'codex' | 'grok' | 'antigravity' | 'pi' | 'crush' | 'aider' | 'kimicode' | 'goose' | 'copilot' | 'terminal' | 'remote' | 'multi-agent' | 'two-agent' | 'three-agent' | 'two-split' | 'three-split' | 'four-split' | null;
 
 /**
  * Tab status shown as an animated 9-dot glyph. Three states only —
@@ -119,8 +119,9 @@ export interface MultiAgentPane {
   // and use the tab-level folderPath (all 4 panes share one workspace because
   // they coordinate via MCP against that workspace's config).
   folderPath?: string | null;
-  // Sentinel Protocol (opt-in per pane). When true, TierTerminal scans the
-  // PTY output stream of this pane for the marker `[COFFEE-DONE:pane<N>]`
+  // Sentinel Protocol (default-on per pane; explicit false disables it).
+  // TierTerminal scans the
+  // PTY output stream of this pane for `[COFFEE-DONE:pane-N->pane-M]`
   // that the user instructs their agent to emit on task completion. On a
   // match, completionTs is set to Date.now() — the pane number badge
   // renders a small green dot while the timestamp is fresh.
@@ -274,7 +275,9 @@ export interface DiffSelection {
 // ─── Tab tool predicates ────────────────────────────────────────────────────
 
 const SPLIT_TOOLS: ReadonlySet<ToolType> = new Set<ToolType>(['two-split', 'three-split', 'four-split']);
+const MULTI_AGENT_TOOLS: ReadonlySet<ToolType> = new Set<ToolType>(['multi-agent', 'two-agent', 'three-agent']);
 export const isSplitTool = (t: ToolType): boolean => SPLIT_TOOLS.has(t);
+export const isMultiAgentTool = (t: ToolType): boolean => MULTI_AGENT_TOOLS.has(t);
 
 // `kind` is a backend protocol contract: `::pane-N` triggers hands-free flag
 // injection (yolo / skip-permissions) for coordinated multi-agent; `::split-N`

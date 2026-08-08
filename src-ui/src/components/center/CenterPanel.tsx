@@ -4,6 +4,7 @@ import { focusTerminal } from '../../lib/focus-registry';
 import { onWindowForeground } from '../../lib/window-focus-filter';
 import { TierTerminal } from './TierTerminal';
 import { FourSplitGrid } from './FourSplitGrid';
+import { MultiAgentGrid } from './MultiAgentGrid';
 import { ToolConfigModal } from './ToolConfigModal';
 import { ContributionHeatmap } from './ContributionHeatmap';
 import { ErrorBoundary } from '../common/ErrorBoundary';
@@ -379,6 +380,39 @@ const SvgFourSplit = () => (
   </svg>
 );
 
+// Coordinated layouts use one shared outline: every pane belongs to the same
+// workspace and can discover, read, and dispatch work to its siblings.
+const CoordinatedLayoutIcon = ({ panes }: { panes: 2 | 3 | 4 }) => (
+  <svg
+    width="1em"
+    height="1em"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.8"
+    strokeLinecap="square"
+    strokeLinejoin="miter"
+    style={{ flexShrink: 0, color: 'var(--accent)', verticalAlign: '-0.125em' }}
+  >
+    <rect x="4" y="4" width="16" height="16" />
+    {panes === 4 ? (
+      <>
+        <line x1="12" y1="5" x2="12" y2="19" strokeLinecap="butt" />
+        <line x1="5" y1="12" x2="19" y2="12" strokeLinecap="butt" />
+      </>
+    ) : (
+      Array.from({ length: panes - 1 }, (_, i) => {
+        const x = 4 + (16 * (i + 1)) / panes;
+        return <line key={x} x1={x} y1="5" x2={x} y2="19" strokeLinecap="butt" />;
+      })
+    )}
+  </svg>
+);
+
+const SvgMultiAgent = () => <CoordinatedLayoutIcon panes={4} />;
+const SvgThreeAgent = () => <CoordinatedLayoutIcon panes={3} />;
+const SvgTwoAgent = () => <CoordinatedLayoutIcon panes={2} />;
+
 // ── Platform-aware Terminal Icon & Label ─────────────────────────────────────
 
 const detectOS = (): 'win' | 'mac' | 'linux' => {
@@ -419,7 +453,7 @@ const SvgPlus = ({ active }: { active: boolean }) => (
 const VALID_PIN_KEYS = new Set<string>([
   'claude', 'opencode', 'mimocode', 'openclaw', 'codex', 'grok', 'antigravity', 'qwen', 'hermes', 'terminal',
   'pi', 'crush', 'aider', 'kimicode', 'goose', 'copilot',
-  'installer', 'four-split', 'three-split', 'two-split',
+  'installer', 'multi-agent', 'three-agent', 'two-agent', 'four-split', 'three-split', 'two-split',
 ]);
 
 // Only tools with an authoritative native OSC title protocol get a Dynamic
@@ -456,17 +490,10 @@ export function CenterPanel() {
       if (stored !== null) {
         let arr = JSON.parse(stored);
         if (!Array.isArray(arr)) return [];
-        // Migrate the retired multi-agent pin to four-split so upgrading
-        // users keep a card in that home-screen slot instead of an empty
-        // hole — the coordinated multi-agent tool was removed and the
-        // independent four-split is its closest replacement. Dedup after,
-        // in case four-split was already pinned.
-        arr = arr.map((id: unknown) => (id === 'agent:multi-agent' ? 'agent:four-split' : id));
         arr = arr.filter((id: unknown, i: number) => arr.indexOf(id) === i);
         // Drop stale pin IDs from retired AGENT_CATALOG entries (e.g.
         // `agent:vibeid` after /vibeid became a skill, or the other retired
-        // coordinated tools `agent:two-agent` / `agent:three-agent` /
-        // `agent:hyper-agent`). These ghosts render nothing but inflate the
+        // retired tools. These ghosts render nothing but inflate the
         // "Agents N/6" counter.
         arr = arr.filter((id: unknown) =>
           typeof id === 'string' && id.startsWith('agent:') && VALID_PIN_KEYS.has(id.slice('agent:'.length))
@@ -486,7 +513,7 @@ export function CenterPanel() {
         'agent:codex',
         'agent:opencode',
         'agent:antigravity',
-        'agent:four-split',
+        'agent:multi-agent',
         'agent:terminal',
       ];
       localStorage.setItem('coffee_pinned_items', JSON.stringify(defaults));
@@ -553,11 +580,33 @@ export function CenterPanel() {
       requiresCwd: !CWD_AGNOSTIC_AI_CLI.has(item.key),
     }));
 
-    // "Agent Tools" grid on the Library page: Terminal + Coffee 101, then
-    // the independent split tools descending 4→3→2.
+    // "Agent Tools" includes coordinated and independent layouts. The
+    // outlined icons share a workspace/MCP topology; filled icons are plain
+    // independent PTYs.
     const utilities = [
       // Terminal is an AI-CLI-like tool (needs cwd) rather than a 'utility'.
       { key: 'terminal' as ToolType, label: t('tool.terminal'), icon: <TerminalIcon />, type: 'ai-cli' as const, requiresCwd: true },
+      {
+        key: 'multi-agent' as ToolType,
+        label: t('tool.multi_agent'),
+        icon: <SvgMultiAgent />,
+        type: 'utility' as const,
+        requiresCwd: true,
+      },
+      {
+        key: 'three-agent' as ToolType,
+        label: t('tool.three_agent'),
+        icon: <SvgThreeAgent />,
+        type: 'utility' as const,
+        requiresCwd: true,
+      },
+      {
+        key: 'two-agent' as ToolType,
+        label: t('tool.two_agent'),
+        icon: <SvgTwoAgent />,
+        type: 'utility' as const,
+        requiresCwd: true,
+      },
       // ─── Independent split (descending 4→3→2): N side-by-side PTYs ──
       {
         key: 'four-split' as ToolType,
@@ -1185,6 +1234,9 @@ export function CenterPanel() {
         return { icon: <TerminalIcon />, title, tooltip: undefined };
       }
       case 'terminal': return { icon: <TerminalIcon />, title: cwd ?? t('tool.terminal'), tooltip: pathTip };
+      case 'multi-agent': return { icon: <SvgMultiAgent />, title: cwd ?? t('tool.multi_agent'), tooltip: pathTip };
+      case 'two-agent': return { icon: <SvgTwoAgent />, title: cwd ?? t('tool.two_agent'), tooltip: pathTip };
+      case 'three-agent': return { icon: <SvgThreeAgent />, title: cwd ?? t('tool.three_agent'), tooltip: pathTip };
       case 'two-split': return { icon: <SvgTwoSplit />, title: cwd ?? t('tool.two_split' as any), tooltip: pathTip };
       case 'three-split': return { icon: <SvgThreeSplit />, title: cwd ?? t('tool.three_split' as any), tooltip: pathTip };
       case 'four-split': return { icon: <SvgFourSplit />, title: cwd ?? t('tool.four_split' as any), tooltip: pathTip };
@@ -1386,7 +1438,30 @@ export function CenterPanel() {
               position: 'relative'
             }}
           >
-            {t.tool === 'two-split' ? (
+            {t.tool === 'multi-agent' ? (
+              <MultiAgentGrid
+                tab={t}
+                hasBg={hasBg}
+                bgUrl={bgUrl}
+                bgType={bgType}
+              />
+            ) : t.tool === 'two-agent' ? (
+              <MultiAgentGrid
+                tab={t}
+                hasBg={hasBg}
+                bgUrl={bgUrl}
+                bgType={bgType}
+                paneCount={2}
+              />
+            ) : t.tool === 'three-agent' ? (
+              <MultiAgentGrid
+                tab={t}
+                hasBg={hasBg}
+                bgUrl={bgUrl}
+                bgType={bgType}
+                paneCount={3}
+              />
+            ) : t.tool === 'two-split' ? (
               <FourSplitGrid
                 tab={t}
                 hasBg={hasBg}
@@ -1917,4 +1992,3 @@ export function CenterPanel() {
     </>
   );
 }
-

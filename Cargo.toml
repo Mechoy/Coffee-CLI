@@ -19,9 +19,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # Tier Terminal — PTY (portable-pty, WezTerm's cross-platform PTY library)
 portable-pty = "0.9"
-# Only `task::spawn_blocking` is used by the system-font scanner. The old
-# loopback hook server and its network/runtime features have been removed.
-tokio = { version = "1", features = ["rt"] }
+# The per-pane MCP servers need networking, timers, sync primitives, and
+# detached tasks in addition to the existing spawn_blocking calls.
+tokio = { version = "1", features = ["full"] }
 
 # Regex (used by terminal.rs for ANSI strip)
 regex = "1"
