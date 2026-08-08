@@ -123,6 +123,8 @@ export const commands = {
     invoke<void>('tier_terminal_start', { sessionId, tool, toolData: toolData ?? null, cols, rows, themeMode, locale: locale ?? null, cwd: cwd ?? null, resumeToken: resumeToken ?? null, shell: shell ?? null }),
   tierTerminalInput: (sessionId: string, data: string) => 
     invoke<void>('tier_terminal_input', { sessionId, data }),
+  tierTerminalMarkDone: (sessionId: string) =>
+    invoke<void>('tier_terminal_mark_done', { sessionId }),
   /** Raw write used for system-generated input (auto-skip prompts, etc.). */
   tierTerminalRawWrite: (sessionId: string, data: string) =>
     invoke<void>('tier_terminal_raw_write', { sessionId, data }),

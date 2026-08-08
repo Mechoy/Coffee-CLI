@@ -461,6 +461,7 @@ function TierTerminalImpl({
   // is unstable here. Not reset on successful re-attach.
   const contextLossAttemptsRef = useRef(0);
   const grokPermissionReleaseTimerRef = useRef<number | undefined>(undefined);
+  const nativeAgentStatusRef = useRef<AgentStatus | null>(null);
 
   // ── Startup splash state ─────────────────────────────────────────────────
   const [showSplash, setShowSplash] = useState(true);
@@ -1111,6 +1112,7 @@ function TierTerminalImpl({
       }
     };
     const setGrokStatus = (status: AgentStatus) => {
+      nativeAgentStatusRef.current = status;
       if (status === grokStatus) return;
       grokStatus = status;
       dispatch({ type: 'SET_AGENT_STATUS', id: sessionId, status });
@@ -1120,10 +1122,12 @@ function TierTerminalImpl({
       if (tool === 'claude') {
         const parsed = parseClaudeTerminalTitle(title);
         displayTitle = parsed.displayTitle;
+        nativeAgentStatusRef.current = parsed.status;
         dispatch({ type: 'SET_AGENT_STATUS', id: sessionId, status: parsed.status });
       } else if (tool === 'codex') {
         const parsed = parseCodexTerminalTitle(title);
         displayTitle = parsed.displayTitle;
+        nativeAgentStatusRef.current = parsed.status;
         dispatch({ type: 'SET_AGENT_STATUS', id: sessionId, status: parsed.status });
       } else if (tool === 'grok') {
         const parsed = parseGrokTerminalTitle(title);
@@ -1292,14 +1296,28 @@ function TierTerminalImpl({
                 if (emitterPane && emitterPane.sentinelEnabled !== false) {
                   dispatch({ type: 'SET_PANE_COMPLETION', tabId, paneIdx: emitter, ts: Date.now() });
                   const targetPane = panes.find(p => p.paneIdx === target);
+                  let wakeTarget: (() => void) | undefined;
                   if (targetPane && targetPane.sentinelEnabled !== false && targetPane.tool !== null && target !== emitter) {
                     const targetId = `${tabId}::pane-${target}`;
                     const notify = `[From pane-${emitter}] Task complete.`;
                     // Completion receipts can arrive from several panes in
                     // the same render frame. Serialize them so each delayed
                     // CR submits exactly one notification.
-                    getTabActions(targetId)?.enqueueSubmission(notify);
+                    wakeTarget = () => {
+                      getTabActions(targetId)?.enqueueSubmission(notify);
+                    };
                   }
+                  // The PTY emitter stores this chunk in read_pane's buffer
+                  // before emitting it. Commit the matching backend state
+                  // before waking the caller so its immediate read cannot
+                  // observe the old `working` state. The emitter remains
+                  // complete even when its requested target no longer exists.
+                  commands.tierTerminalMarkDone(sessionId)
+                    .then(() => wakeTarget?.())
+                    .catch((error) => {
+                      console.warn('[Sentinel] Failed to mark pane complete:', error);
+                      wakeTarget?.();
+                    });
                 }
               }
 
@@ -1313,6 +1331,7 @@ function TierTerminalImpl({
           if (!mounted || running) return;
           setProcessExited(true);
           if (usesNativeStatus) {
+            nativeAgentStatusRef.current = 'idle';
             dispatch({ type: 'SET_AGENT_STATUS', id: sessionId, status: 'idle' });
           }
         },
@@ -1329,6 +1348,7 @@ function TierTerminalImpl({
           if (!mounted) return;
           setProcessExited(true);
           if (usesNativeStatus) {
+            nativeAgentStatusRef.current = 'idle';
             dispatch({ type: 'SET_AGENT_STATUS', id: sessionId, status: 'idle' });
           }
         },
@@ -1609,6 +1629,13 @@ function TierTerminalImpl({
 
     const drainQueuedSubmissions = () => {
       queuedSubmitTimer = null;
+      // A completion can arrive while this pane is still finishing its own
+      // turn. Injecting into a busy full-screen TUI can merge with or discard
+      // the receipt, so retain it until the native title reports idle.
+      if (supportsNativeAgentStatus(tool) && nativeAgentStatusRef.current !== null && nativeAgentStatusRef.current !== 'idle') {
+        queuedSubmitTimer = setTimeout(drainQueuedSubmissions, 100);
+        return;
+      }
       const text = queuedSubmissions.shift();
       if (text === undefined) return;
       if (!pasteAndSubmit(text)) {

@@ -457,6 +457,29 @@ function reducer(state: AppState, action: Action): AppState {
     case 'SET_AGENT_STATUS':
       // Native-title tools emit frequent OSC activity frames. Their parsers
       // dispatch each frame, but equal states must not re-render the app.
+      // Multi-agent terminals use a nested `${tabId}::pane-N` session id;
+      // persist those statuses on the pane so completion receipts can wait
+      // until the target CLI has actually returned to its input prompt.
+      {
+        const paneMatch = /^(.+)::pane-(\d+)$/.exec(action.id);
+        if (paneMatch) {
+          const tabId = paneMatch[1];
+          const paneIdx = Number(paneMatch[2]);
+          const tab = state.terminals.find(t => t.id === tabId);
+          const pane = tab?.multiAgent?.panes.find(p => p.paneIdx === paneIdx);
+          if (!pane || !supportsNativeAgentStatus(pane.tool) || pane.agentStatus === action.status) return state;
+          return {
+            ...state,
+            terminals: state.terminals.map(t => t.id !== tabId || !t.multiAgent ? t : {
+              ...t,
+              multiAgent: {
+                ...t.multiAgent,
+                panes: t.multiAgent.panes.map(p => p.paneIdx === paneIdx ? { ...p, agentStatus: action.status } : p),
+              },
+            }),
+          };
+        }
+      }
       if (!state.terminals.some(t => t.id === action.id && supportsNativeAgentStatus(t.tool))) return state;
       if (state.terminals.some(t => t.id === action.id && t.agentStatus === action.status)) return state;
       return {

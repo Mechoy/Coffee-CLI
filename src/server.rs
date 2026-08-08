@@ -1170,6 +1170,29 @@ fn tier_terminal_input(
     Ok(())
 }
 
+/// Commit a Sentinel DONE receipt before the frontend wakes the requesting
+/// pane. This makes completion authoritative for MCP read_pane instead of
+/// relying on output-silence heuristics that can lag behind the receipt.
+#[tauri::command]
+fn tier_terminal_mark_done(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let activity = {
+        let map = state.terminal_session.lock().unwrap();
+        match map.get(&session_id) {
+            Some(s) => s.activity.clone(),
+            None => return Err(format!("No active terminal session for id: {}", session_id)),
+        }
+    };
+
+    let mut activity = activity
+        .lock()
+        .map_err(|e| format!("Activity lock poisoned: {}", e))?;
+    activity.mark_done();
+    Ok(())
+}
+
 /// Raw write used for system-generated input like auto-skip Enter for the
 /// Claude trust prompt.
 #[tauri::command]
@@ -4181,6 +4204,7 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
             set_frosted_backdrop,
             tier_terminal_start,
             tier_terminal_input,
+            tier_terminal_mark_done,
             tier_terminal_raw_write,
             tier_terminal_kill,
             tier_terminal_resize,

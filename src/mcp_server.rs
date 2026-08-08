@@ -308,7 +308,7 @@ impl PaneStore {
                         .map_err(|e| format!("pty flush failed: {}", e))?;
                 }
                 if let Ok(mut act) = activity_arc.lock() {
-                    act.last_status = "working".to_string();
+                    act.mark_working();
                 }
                 Ok(())
             })
@@ -441,7 +441,7 @@ impl PaneStore {
                         .activity
                         .lock()
                         .map_err(|_| "activity poisoned".to_string())?;
-                    let at_prompt = act.last_status == "wait_input";
+                    let at_prompt = act.is_done();
                     let now = Instant::now();
                     let produced_since_send = act.last_output_at >= send_time;
                     let silence = now.duration_since(act.last_output_at);
@@ -465,7 +465,7 @@ impl PaneStore {
 
                     let idle = marker_path || settle_path;
                     if idle {
-                        act.last_status = "wait_input".to_string();
+                        act.mark_done();
                     }
                     Ok(idle)
                 })
@@ -546,7 +546,7 @@ impl PaneStore {
             let is_idle = sess
                 .activity
                 .lock()
-                .map(|a| a.last_status == "wait_input")
+                .map(|a| a.is_done())
                 .unwrap_or(false);
 
             drop(guard);

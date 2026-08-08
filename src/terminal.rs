@@ -467,6 +467,20 @@ pub struct SessionActivity {
     pub last_status: String,
 }
 
+impl SessionActivity {
+    pub fn mark_working(&mut self) {
+        self.last_status = "working".to_string();
+    }
+
+    pub fn mark_done(&mut self) {
+        self.last_status = "wait_input".to_string();
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.last_status == "wait_input"
+    }
+}
+
 pub struct TerminalOutputBuffer {
     chunks: std::collections::VecDeque<String>,
     bytes: usize,
@@ -1145,20 +1159,21 @@ pub fn spawn(
                     }
                 }
 
+                // Keep the MCP result tail current before the frontend can
+                // observe a DONE marker in this same chunk and wake a peer.
+                if let Ok(mut ring) = output_buffer_for_emitter.lock() {
+                    ring.push(data.clone());
+                }
+
                 // Single coalesced IPC emit — replaces what used to be
                 // N × small emits per burst.
                 let _ = app_out.emit(
                     "tier-terminal-output",
                     TerminalOutput {
                         id: session_id_out.clone(),
-                        data: data.clone(),
+                        data,
                     },
                 );
-
-                // Keep only the recent tail needed by MCP read_pane.
-                if let Ok(mut ring) = output_buffer_for_emitter.lock() {
-                    ring.push(data);
-                }
 
                 if let Some(new_cwd) = cwd_change {
                     eprintln!("[Tier Terminal] CWD changed: {}", new_cwd);
@@ -1339,6 +1354,32 @@ mod tests {
         buffer.push("next task".to_string());
         assert_eq!(buffer.joined(), "next task");
         assert!(!buffer.prefix_truncated());
+    }
+
+    #[test]
+    fn session_activity_done_overrides_dispatched_working() {
+        let mut activity = SessionActivity {
+            last_output_at: Instant::now(),
+            last_status: "wait_input".to_string(),
+        };
+
+        activity.mark_working();
+        assert!(!activity.is_done());
+
+        activity.mark_done();
+        assert!(activity.is_done());
+    }
+
+    #[test]
+    fn session_activity_next_dispatch_resets_done_state() {
+        let mut activity = SessionActivity {
+            last_output_at: Instant::now(),
+            last_status: "working".to_string(),
+        };
+
+        activity.mark_done();
+        activity.mark_working();
+        assert!(!activity.is_done());
     }
 
     // ── find_preset ───────────────────────────────────────────────────────────
