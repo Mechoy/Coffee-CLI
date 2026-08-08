@@ -474,7 +474,10 @@ pub struct TerminalOutputBuffer {
 
 impl TerminalOutputBuffer {
     const MAX_CHUNKS: usize = 2000;
-    const MAX_BYTES: usize = 2 * 1024 * 1024;
+    // This buffer exists only for MCP read_pane, not terminal rendering.
+    // Interactive CLIs redraw spinners with carriage returns, so a small
+    // number of apparent lines can otherwise retain megabytes of stale frames.
+    const MAX_BYTES: usize = 512 * 1024;
 
     fn new() -> Self {
         Self {

@@ -1295,11 +1295,10 @@ function TierTerminalImpl({
                   if (targetPane && targetPane.sentinelEnabled !== false && targetPane.tool !== null && target !== emitter) {
                     const targetId = `${tabId}::pane-${target}`;
                     const notify = `[From pane-${emitter}] Task complete.`;
-                    // `paste()` (see registerTabActions below) handles the
-                    // trailing CR — it schedules `\r` 30ms after the paste
-                    // so the TUI treats it as Enter rather than part of
-                    // the bracketed-paste buffer. Don't re-send the CR.
-                    getTabActions(targetId)?.paste(notify);
+                    // Completion receipts can arrive from several panes in
+                    // the same render frame. Serialize them so each delayed
+                    // CR submits exactly one notification.
+                    getTabActions(targetId)?.enqueueSubmission(notify);
                   }
                 }
               }
@@ -1576,33 +1575,57 @@ function TierTerminalImpl({
   // TierTerminal tree, so it can't access xtermRef directly — it looks up
   // the active tab's actions in the registry instead.
   useEffect(() => {
+    let queuedSubmitTimer: ReturnType<typeof setTimeout> | null = null;
+    const queuedSubmissions: string[] = [];
+
+    const pasteAndSubmit = (text: string): boolean => {
+      const term = xtermRef.current;
+      // If the xterm isn't mounted yet (tab still loading, PTY spawn in
+      // flight, etc.) report failure so the caller can preserve the
+      // source draft instead of silently losing it.
+      if (!term) return false;
+      // term.paste() goes through onData, which our handler forwards to the
+      // PTY with bracketed-paste framing when the TUI has enabled it.
+      // Newlines and IME composition round-trip correctly. Follow with CR
+      // to submit.
+      //
+      // Defer the CR so it arrives as a separate PTY read. Claude Code's
+      // Ink input handler enters a paste-end digestion state for ~100ms
+      // after the bracketed-paste close (`\x1b[201~`) — any CR that lands
+      // inside that window is absorbed as part of the paste buffer, so the
+      // text stays in the prompt without submitting. The original 30ms
+      // worked on older Claude versions; modern builds need ≥120ms (live
+      // measurement on 2026-04-26 was 152–164ms across two pane types).
+      // 150ms with the natural ~10ms timer slack puts us comfortably past
+      // the window. Windows ConPTY coalesces PTY writes differently but
+      // the delay is harmless there.
+      term.paste(normalizePasteNewlines(text));
+      setTimeout(() => {
+        markNotifySoundPromptSubmitted(sessionId, tool);
+        commands.tierTerminalInput(sessionId, '\r').catch(() => {});
+      }, 150);
+      return true;
+    };
+
+    const drainQueuedSubmissions = () => {
+      queuedSubmitTimer = null;
+      const text = queuedSubmissions.shift();
+      if (text === undefined) return;
+      if (!pasteAndSubmit(text)) {
+        queuedSubmissions.length = 0;
+        return;
+      }
+      // Leave enough time for paste framing, the delayed CR, and the TUI's
+      // prompt transition before writing the next completion receipt.
+      queuedSubmitTimer = setTimeout(drainQueuedSubmissions, 350);
+    };
+
     const unregister = registerTabActions(sessionId, {
-      paste: (text: string): boolean => {
-        const term = xtermRef.current;
-        // If the xterm isn't mounted yet (tab still loading, PTY spawn in
-        // flight, etc.) report failure so the caller can preserve the
-        // source draft instead of silently losing it.
-        if (!term) return false;
-        // term.paste() goes through onData, which our handler forwards to the
-        // PTY with bracketed-paste framing when the TUI has enabled it.
-        // Newlines and IME composition round-trip correctly. Follow with CR
-        // to submit.
-        //
-        // Defer the CR so it arrives as a separate PTY read. Claude Code's
-        // Ink input handler enters a paste-end digestion state for ~100ms
-        // after the bracketed-paste close (`\x1b[201~`) — any CR that lands
-        // inside that window is absorbed as part of the paste buffer, so the
-        // text stays in the prompt without submitting. The original 30ms
-        // worked on older Claude versions; modern builds need ≥120ms (live
-        // measurement on 2026-04-26 was 152–164ms across two pane types).
-        // 150ms with the natural ~10ms timer slack puts us comfortably past
-        // the window. Windows ConPTY coalesces PTY writes differently but
-        // the delay is harmless there.
-        term.paste(normalizePasteNewlines(text));
-        setTimeout(() => {
-          markNotifySoundPromptSubmitted(sessionId, tool);
-          commands.tierTerminalInput(sessionId, '\r').catch(() => {});
-        }, 150);
+      paste: pasteAndSubmit,
+      enqueueSubmission: (text: string): boolean => {
+        if (!xtermRef.current) return false;
+        queuedSubmissions.push(text);
+        if (queuedSubmitTimer === null) drainQueuedSubmissions();
         return true;
       },
       insertText: (text: string): boolean => {
@@ -1629,7 +1652,11 @@ function TierTerminalImpl({
         };
       },
     });
-    return unregister;
+    return () => {
+      if (queuedSubmitTimer !== null) clearTimeout(queuedSubmitTimer);
+      queuedSubmissions.length = 0;
+      unregister();
+    };
   }, [sessionId, tool]);
 
   // ── File-drop target ────────────────────────────────────────────────────

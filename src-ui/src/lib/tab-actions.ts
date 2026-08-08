@@ -16,6 +16,10 @@ export interface TabActions {
    *  yet, etc.). Callers use the return value to decide whether to clear
    *  the source draft — silent failures must not lose user text. */
   paste: (text: string) => boolean;
+  /** Queue an internally generated message for submission. Unlike `paste`,
+   *  queued messages are serialized so simultaneous agent notifications do
+   *  not merge before the delayed CR reaches the PTY. */
+  enqueueSubmission: (text: string) => boolean;
   /** Insert text at the cursor without submitting. Used by file-drop:
    *  dragging a file into the terminal should mirror OS-native terminal
    *  behavior — the path appears at the cursor as if typed, and the user

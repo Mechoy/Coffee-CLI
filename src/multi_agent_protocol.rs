@@ -75,9 +75,10 @@ target in your DONE marker.
   `"pane-N"`. The call returns immediately — there is no waiting
   mode. Coffee-CLI auto-prefixes `text` with `[From {pane_short}]`
   so the receiver knows who dispatched.
-- **read_pane(id, last_n_lines?)** → read a peer's recent output
-  (ANSI stripped). Useful for sanity checks; not normally needed
-  because the wake-up message already tells you when to look.
+- **read_pane(id, last_n_lines?)** → read a peer's bounded recent output
+  (ANSI stripped). Use it only after a Task complete wake-up, or when the
+  human explicitly asks you to inspect a pane. Never use it for progress
+  polling and never combine it with sleep/wait loops.
 
 ## DONE marker (when you are the receiver)
 
@@ -95,6 +96,9 @@ sits idle indefinitely.
 - One dispatch ends your turn. Don't chain `send_to_pane` calls or
   follow them with more work in the same turn — let the wake-up
   bring you back.
+- Never call sleep/wait to watch a peer and never poll `read_pane` after
+  dispatch. Those loops keep your model turn alive and repeatedly feed
+  terminal redraw noise back into your context.
 - Don't self-dispatch — `send_to_pane("{pane_short}", ...)` is rejected.
 - The DONE marker is ONLY a completion signal, never a way to send
   new work. Use `send_to_pane` for that.

@@ -6,8 +6,8 @@
 //!   their CLI type, state (empty / idle / busy / terminated), and titles.
 //! - `send_to_pane(id, text)` — inject a task into another pane's PTY and
 //!   return immediately.
-//! - `read_pane(id, last_n_lines)` — read recent output from another pane
-//!   (ANSI-stripped), useful for checking on a fire-and-forget dispatch.
+//! - `read_pane(id, last_n_lines)` — read bounded recent output from another
+//!   pane after its completion notification (ANSI-stripped).
 //!
 //! HTTP transport (not stdio) because Coffee-CLI is a resident Tauri
 //! process and can't be spawned as a subprocess by each CLI. Every pane gets
@@ -33,6 +33,10 @@ use std::{
 };
 
 use crate::terminal::SharedSession;
+
+const READ_PANE_DEFAULT_LINES: usize = 80;
+const READ_PANE_MAX_LINES: usize = 200;
+const READ_PANE_MAX_BYTES: usize = 32 * 1024;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -506,15 +510,9 @@ impl PaneStore {
 
         let stripped = self.ansi_re.replace_all(&raw_diff, "").to_string();
 
-        // Cap at last 200 lines; the MCP caller can re-read via read_pane
-        // if it needs more. Keeps tool-result payload bounded.
-        let trimmed = {
-            let mut lines: Vec<&str> = stripped.lines().collect();
-            if lines.len() > 200 {
-                lines = lines.split_off(lines.len() - 200);
-            }
-            lines.join("\n")
-        };
+        // Keep the dormant legacy wait-mode path safe if it is ever exposed
+        // again: carriage-return redraws require a byte cap, not just lines.
+        let trimmed = bounded_output_tail(&stripped, 200, READ_PANE_MAX_BYTES);
 
         Ok(DispatchResult {
             bytes_written,
@@ -548,24 +546,23 @@ impl PaneStore {
                 ring.joined()
             };
 
+            // Silence is not completion: a CLI can spend minutes waiting for
+            // an API response without producing terminal output. Only the
+            // explicit prompt marker makes peer output eligible for return.
             let is_idle = sess
                 .activity
                 .lock()
-                .map(|a| {
-                    a.last_status == "wait_input"
-                        || a.last_output_at.elapsed() > Duration::from_secs(15)
-                })
+                .map(|a| a.last_status == "wait_input")
                 .unwrap_or(false);
 
             drop(guard);
 
-            // Strip ANSI, keep last N lines.
+            // Strip ANSI, then enforce both line and byte limits. Terminal
+            // spinners frequently repaint with bare carriage returns, which
+            // can produce one enormous logical line and bypass a line-only cap.
             let stripped = ansi_re.replace_all(&joined, "").to_string();
-            let mut lines: Vec<&str> = stripped.lines().collect();
-            if lines.len() > last_n {
-                lines = lines.split_off(lines.len() - last_n);
-            }
-            Ok((lines.join("\n"), is_idle))
+            let output = bounded_output_tail(&stripped, last_n, READ_PANE_MAX_BYTES);
+            Ok((output, is_idle))
         })
         .await
         .map_err(|e| format!("blocking task join failed: {}", e))?
@@ -573,8 +570,7 @@ impl PaneStore {
 }
 
 /// Outcome of `PaneStore::dispatch` — conveyed back to the MCP caller so
-/// it can distinguish "CLI finished and here's its reply" from "timeout,
-/// reply may still be coming, use read_pane to poll" from fire-and-forget.
+/// legacy wait-mode users can distinguish completion from timeout.
 #[derive(Debug)]
 pub struct DispatchResult {
     pub bytes_written: usize,
@@ -632,7 +628,8 @@ pub struct ReadPaneArgs {
     /// Target pane. Same conventions as `send_to_pane`: short form
     /// (`pane-1`) preferred, full id and bare digit also accepted.
     pub id: String,
-    /// Max recent lines to return. Default 200, max 2000.
+    /// Max recent lines to return. Default 80, max 200. Results also have a
+    /// strict 32 KiB UTF-8-safe limit so terminal redraws cannot flood context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_n_lines: Option<usize>,
 }
@@ -698,9 +695,35 @@ fn same_tab(left: &str, right: &str) -> bool {
     tab_prefix(left) == tab_prefix(right)
 }
 
+fn bounded_output_tail(input: &str, max_lines: usize, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    let mut lines: Vec<&str> = input.lines().collect();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    let by_lines = lines.join("\n");
+    if by_lines.len() <= max_bytes {
+        return by_lines;
+    }
+
+    const MARKER: &str = "[... earlier terminal output truncated ...]\n";
+    if max_bytes <= MARKER.len() {
+        return MARKER[..max_bytes].to_string();
+    }
+    let tail_budget = max_bytes.saturating_sub(MARKER.len());
+    let mut start = by_lines.len().saturating_sub(tail_budget);
+    while start < by_lines.len() && !by_lines.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{MARKER}{}", &by_lines[start..])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resolve_pane_id, same_tab, tab_prefix};
+    use super::{bounded_output_tail, resolve_pane_id, same_tab, tab_prefix};
 
     #[test]
     fn tab_prefix_extracts_tab_portion() {
@@ -742,6 +765,20 @@ mod tests {
     fn same_tab_accepts_siblings_and_rejects_other_tabs() {
         assert!(same_tab("tab-A::pane-1", "tab-A::pane-2"));
         assert!(!same_tab("tab-A::pane-1", "tab-B::pane-2"));
+    }
+
+    #[test]
+    fn output_tail_keeps_only_requested_lines() {
+        assert_eq!(bounded_output_tail("one\ntwo\nthree", 2, 1024), "two\nthree");
+    }
+
+    #[test]
+    fn output_tail_caps_single_long_line_without_splitting_utf8() {
+        let input = format!("{}咖啡", "x".repeat(4096));
+        let output = bounded_output_tail(&input, 200, 128);
+        assert!(output.len() <= 128);
+        assert!(output.starts_with("[... earlier terminal output truncated ...]"));
+        assert!(output.ends_with("咖啡"));
     }
 }
 
@@ -933,8 +970,10 @@ Self-dispatch and cross-tab dispatch are rejected."
 
     #[tool(
         description = "Read the most recent output lines from another pane. \
-Useful after a send_to_pane(wait=false) long task, to check progress or pull final output. \
-Returns plain text (ANSI stripped) and an is_idle flag."
+Use only after Coffee-CLI wakes you with a `Task complete` message, or when the \
+human explicitly asks you to inspect a pane. Do not poll progress, sleep, wait, \
+or repeatedly call read_pane after send_to_pane; end your turn and let the DONE \
+notification reactivate you. Returns bounded plain text and an is_idle flag."
     )]
     async fn read_pane(
         &self,
@@ -956,13 +995,29 @@ Returns plain text (ANSI stripped) and an is_idle flag."
                 )]));
             }
         }
-        let last_n = args.last_n_lines.unwrap_or(200).min(2000);
+        let last_n = args
+            .last_n_lines
+            .unwrap_or(READ_PANE_DEFAULT_LINES)
+            .clamp(1, READ_PANE_MAX_LINES);
         match self.panes.read(&target_id, last_n).await {
             Ok((output, is_idle)) => {
-                let payload = serde_json::json!({
-                    "output": output,
-                    "is_idle": is_idle,
-                });
+                let payload = if is_idle {
+                    serde_json::json!({
+                        "status": "idle",
+                        "output": output,
+                        "is_idle": true,
+                    })
+                } else {
+                    // A busy pane can contain thousands of spinner redraws.
+                    // Returning none of them is also a runtime guard against
+                    // models that ignore the fire-and-forget protocol.
+                    serde_json::json!({
+                        "status": "working",
+                        "output": "",
+                        "is_idle": false,
+                        "instruction": "End your turn now. Do not sleep, wait, or poll read_pane. Coffee-CLI will reactivate you when this pane emits DONE."
+                    })
+                };
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&payload).unwrap_or_default(),
                 )]))
@@ -986,6 +1041,8 @@ impl ServerHandler for CoffeeMcp {
                 "Coffee-CLI multi-agent MCP server. \
 Tools: whoami, list_panes, send_to_pane, read_pane. \
 Use these to coordinate ACROSS different CLIs (Claude/Codex/OpenCode). \
+After send_to_pane, end the turn immediately. Never poll, sleep, or wait for a peer; \
+the DONE notification will reactivate the caller. Read peer output only after that notification. \
 For intra-CLI parallelism, prefer your native subagent SDK (Agent Teams / app-server / TaskTool). \
 The caller's system prompt contains the full coordination protocol."
                     .to_string(),
