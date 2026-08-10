@@ -125,13 +125,18 @@ export function App() {
     }
     try { localStorage.setItem('cc-shape', state.currentShape); } catch {}
 
-    // Frost = native Windows Acrylic (real desktop blur). Fire-and-forget;
-    // non-Tauri dev builds and non-Windows skip it inside Rust.
+    // Frost = OS/compositor blur under a CSS tint from the selected theme.
+    // Windows uses DWM Acrylic, macOS NSVisualEffectView, and Linux requests
+    // KWin's native X11/Wayland blur when available. Other Linux compositors
+    // keep genuine translucency without substituting an in-app wallpaper.
     const inv = retryInvoke();
     if (inv) {
-      inv('set_frosted_backdrop', { on: frost }).catch(() => {});
+      inv('set_frosted_backdrop', {
+        on: frost,
+        dark: state.currentTheme !== 'light',
+      }).catch(() => {});
     }
-  }, [state.currentShape]);
+  }, [state.currentShape, state.currentTheme]);
 
   // Sync the UI language to the <html> lang attribute so CSS :lang(zh)
   // selectors can fire. This is what swaps the splash-label out of the
