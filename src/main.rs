@@ -8,6 +8,8 @@ mod fs_watcher;
 mod launch;
 mod mcp_server;
 mod mcp_injector;
+mod mcp_config;
+mod multi_agent_workspace;
 mod multi_agent_protocol;
 mod tool_config;
 mod tools;

@@ -20,10 +20,11 @@ import { IS_MACOS, IS_WINDOWS } from '../../lib/platform';
 import { TERM_COLOR_SCHEMES } from '../center/TierTerminal';
 import { commands, type FontInfo } from '../../tauri';
 import { FontPicker } from './FontPicker';
+import { McpSettings } from '../../features/mcp/McpSettings';
 import { THEME_COLORS, THEME_SHAPES, ICON_ART_THEMES, LANGUAGES, TASK_VIEW_MODES, isMaskTintTheme } from '../../lib/personalization';
 import './SettingsModal.css';
 
-type Section = 'appearance' | 'wallpaper' | 'terminal' | 'gambit' | 'sound' | 'tasks' | 'language' | 'feedback';
+type Section = 'appearance' | 'wallpaper' | 'terminal' | 'mcp' | 'gambit' | 'sound' | 'tasks' | 'language' | 'feedback';
 
 // Trailing "opens outside the app" affordance on the feedback cards.
 const ExternalLinkArrow = () => (
@@ -79,6 +80,11 @@ const ICONS: Record<Section, ReactNode> = {
   terminal: (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="m7 11 2-2-2-2" /><path d="M11 13h4" /><rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
+    </svg>
+  ),
+  mcp: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M7 8a4 4 0 1 1 4-4v16a4 4 0 1 1-4-4h10a4 4 0 1 1-4 4V4a4 4 0 1 1 4 4H7Z" />
     </svg>
   ),
   gambit: (
@@ -252,6 +258,7 @@ export function SettingsModal() {
     { id: 'appearance', label: t('settings.appearance' as any) },
     { id: 'wallpaper',  label: t('settings.wallpaper' as any) },
     { id: 'terminal',   label: t('settings.terminal' as any) },
+    { id: 'mcp',        label: t('settings.mcp' as any) },
     { id: 'gambit',     label: t('settings.gambit' as any) },
     { id: 'sound',      label: t('settings.sound' as any) },
     { id: 'tasks',      label: t('settings.tasks' as any) },
@@ -640,6 +647,8 @@ export function SettingsModal() {
                 </div>
               </>
             )}
+
+            {section === 'mcp' && <McpSettings />}
 
             {section === 'language' && (
               <div className="settings-lang-list">

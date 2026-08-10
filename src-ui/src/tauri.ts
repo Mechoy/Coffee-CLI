@@ -17,6 +17,27 @@ export const isTauri =
   typeof window !== 'undefined' &&
   (!!window.__TAURI_INTERNALS__ || !!window.__TAURI__);
 
+function createRendererInstanceId(): string {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === 'function') return cryptoApi.randomUUID();
+
+  const bytes = new Uint8Array(16);
+  if (typeof cryptoApi?.getRandomValues === 'function') {
+    cryptoApi.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/** One identity per WebView lifetime; never persisted or exposed to agents. */
+export const rendererInstanceId = createRendererInstanceId();
+
 // Resolve the invoke function across Tauri v1 / v2
 function resolveInvoke(): ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null {
   const w = window as unknown as Record<string, unknown>;
@@ -96,6 +117,103 @@ export interface SavedSession {
   turn_count?: number;
 }
 
+/**
+ * Topology-only checkpoint for a coordinated multi-agent workspace. Native
+ * CLI resume tokens deliberately never cross this boundary: the backend keeps
+ * them in its protected snapshot and validates the restore lease itself.
+ */
+export interface WorkspacePaneCheckpoint {
+  pane_index: number;
+  tool: string | null;
+  sentinel_enabled: boolean;
+  mcp_selection: McpProfileSelection;
+  continuation?: 'fresh_by_user' | 'skipped' | null;
+}
+
+export interface WorkspaceCheckpoint {
+  snapshot_id: string;
+  workspace: string;
+  pane_count: number;
+  checkpoint_version: number;
+  panes: WorkspacePaneCheckpoint[];
+}
+
+export interface ContinuationSummary {
+  state: 'empty' | 'known' | 'needs_binding' | 'fresh_by_user' | 'skipped' | 'unsupported';
+  reason: string | null;
+  source: 'runtime_capture' | 'managed_claude_session' | 'manual_binding' | null;
+  observed_at: number | null;
+}
+
+export interface WorkspacePaneSummary {
+  pane_index: number;
+  tool: string | null;
+  sentinel_enabled: boolean;
+  mcp_selection: McpProfileSelection;
+  continuation: ContinuationSummary;
+}
+
+export interface WorkspaceSummary {
+  snapshot_id: string;
+  workspace: string;
+  pane_count: number;
+  checkpoint_version: number;
+  revision: number;
+  created_at: number;
+  updated_at: number;
+  panes: WorkspacePaneSummary[];
+}
+
+export type RestorePaneStatus =
+  | 'empty'
+  | 'skipped'
+  | 'resumable'
+  | 'fresh'
+  | 'needs_binding'
+  | 'cwd_missing'
+  | 'tool_missing'
+  | 'mcp_unavailable'
+  | 'token_invalid';
+
+export interface WorkspaceRestorePanePlan {
+  pane_index: number;
+  tool: string | null;
+  sentinel_enabled: boolean;
+  mcp_selection: McpProfileSelection;
+  continuation: ContinuationSummary;
+  status: RestorePaneStatus;
+  reason: string | null;
+}
+
+export interface WorkspaceRestorePlan {
+  snapshot_id: string;
+  revision: number;
+  workspace: string;
+  pane_count: number;
+  checkpoint_version: number;
+  panes: WorkspaceRestorePanePlan[];
+}
+
+export interface BeginWorkspaceRestoreResult {
+  attempt_id: string;
+  plan: WorkspaceRestorePlan;
+}
+
+/** Display-only option for explicitly binding one recovered pane. */
+export interface WorkspaceHistoryCandidate {
+  selection_id: string;
+  name: string;
+  saved_at: string;
+  turn_count?: number;
+}
+
+/** One use of a backend-owned restore lease, bound to one pane launch. */
+export interface RestoreAttemptRef {
+  snapshot_id: string;
+  attempt_id: string;
+  pane_index: number;
+}
+
 export interface DirEntryInfo {
   name: string;
   path: string;
@@ -119,21 +237,21 @@ export const commands = {
   windowClose: () => invoke<void>('window_close'),
 
   // Tier Terminal API
-  tierTerminalStart: (sessionId: string, tool: string | null, cols: number, rows: number, themeMode: string, locale?: string, toolData?: string, cwd?: string, resumeToken?: string, shell?: string) =>
-    invoke<void>('tier_terminal_start', { sessionId, tool, toolData: toolData ?? null, cols, rows, themeMode, locale: locale ?? null, cwd: cwd ?? null, resumeToken: resumeToken ?? null, shell: shell ?? null }),
-  tierTerminalInput: (sessionId: string, data: string) => 
-    invoke<void>('tier_terminal_input', { sessionId, data }),
-  tierTerminalAgentStatus: (sessionId: string, status: 'idle' | 'working' | 'wait_input') =>
-    invoke<void>('tier_terminal_agent_status', { sessionId, status }),
-  tierTerminalFailTask: (sessionId: string, reason: string) =>
-    invoke<void>('tier_terminal_fail_task', { sessionId, reason }),
+  tierTerminalStart: (sessionId: string, runId: string, tool: string | null, cols: number, rows: number, themeMode: string, locale?: string, toolData?: string, cwd?: string, resumeToken?: string, shell?: string, mcpSelection?: McpProfileSelection, workspaceContext?: WorkspaceCheckpoint, restoreAttempt?: RestoreAttemptRef) =>
+    invoke<boolean>('tier_terminal_start', { sessionId, runId, tool, toolData: toolData ?? null, cols, rows, themeMode, locale: locale ?? null, cwd: cwd ?? null, resumeToken: resumeToken ?? null, shell: shell ?? null, mcpSelection: mcpSelection ?? { mode: 'auto' }, workspaceContext: workspaceContext ?? null, restoreAttempt: restoreAttempt ?? null, rendererInstanceId }),
+  tierTerminalInput: (sessionId: string, runId: string, data: string) =>
+    invoke<void>('tier_terminal_input', { sessionId, runId, data }),
+  tierTerminalAgentStatus: (sessionId: string, runId: string, status: 'idle' | 'working' | 'wait_input') =>
+    invoke<void>('tier_terminal_agent_status', { sessionId, runId, status }),
+  tierTerminalFailTask: (sessionId: string, runId: string, reason: string) =>
+    invoke<void>('tier_terminal_fail_task', { sessionId, runId, reason }),
   /** Raw write used for system-generated input (auto-skip prompts, etc.). */
-  tierTerminalRawWrite: (sessionId: string, data: string) =>
-    invoke<void>('tier_terminal_raw_write', { sessionId, data }),
-  tierTerminalKill: (sessionId: string) => 
-    invoke<void>('tier_terminal_kill', { sessionId }),
-  tierTerminalResize: (sessionId: string, cols: number, rows: number) =>
-    invoke<void>('tier_terminal_resize', { sessionId, cols, rows }),
+  tierTerminalRawWrite: (sessionId: string, runId: string, data: string) =>
+    invoke<void>('tier_terminal_raw_write', { sessionId, runId, data }),
+  tierTerminalKill: (sessionId: string, runId: string) =>
+    invoke<void>('tier_terminal_kill', { sessionId, runId }),
+  tierTerminalResize: (sessionId: string, runId: string, cols: number, rows: number) =>
+    invoke<void>('tier_terminal_resize', { sessionId, runId, cols, rows }),
 
   /** Notify the Rust backend that the window's visibility changed.
    *  When hidden=true, every per-session worker thread (ticker, emitter)
@@ -148,11 +266,33 @@ export const commands = {
    *  this session's terminal element enters/leaves the viewport (a tab
    *  switch, not just the whole window hiding) so its backend emitter can
    *  widen its coalesce window while nobody is looking at that tab. */
-  setSessionActive: (sessionId: string, active: boolean) =>
-    invoke<void>('set_session_active', { sessionId, active }),
+  setSessionActive: (sessionId: string, runId: string, active: boolean) =>
+    invoke<void>('set_session_active', { sessionId, runId, active }),
 
   // Session Resume
   getNativeHistory: () => invoke<SavedSession[]>('get_native_history'),
+  registerMultiAgentRenderer: () =>
+    invoke<void>('register_multi_agent_renderer', { rendererInstanceId }),
+  listMultiAgentWorkspaces: () =>
+    invoke<WorkspaceSummary[]>('list_multi_agent_workspaces'),
+  checkpointMultiAgentWorkspace: (checkpoint: WorkspaceCheckpoint, allowCreate: boolean) =>
+    invoke<WorkspaceSummary>('checkpoint_multi_agent_workspace', { checkpoint, allowCreate, rendererInstanceId }),
+  discardMultiAgentWorkspace: (snapshotId: string) =>
+    invoke<void>('discard_multi_agent_workspace', { snapshotId, rendererInstanceId }),
+  listMultiAgentWorkspacePaneHistory: (snapshotId: string, paneIndex: number) =>
+    invoke<WorkspaceHistoryCandidate[]>('list_multi_agent_workspace_pane_history', { snapshotId, paneIndex }),
+  bindMultiAgentWorkspacePane: (snapshotId: string, paneIndex: number, selectionId: string) =>
+    invoke<WorkspaceSummary>('bind_multi_agent_workspace_pane', { snapshotId, paneIndex, selectionId, rendererInstanceId }),
+  setMultiAgentWorkspacePaneContinuation: (snapshotId: string, paneIndex: number, choice: 'fresh_by_user' | 'skipped') =>
+    invoke<WorkspaceSummary>('set_multi_agent_workspace_pane_continuation', { snapshotId, paneIndex, choice, rendererInstanceId }),
+  preflightMultiAgentWorkspace: (snapshotId: string) =>
+    invoke<WorkspaceRestorePlan>('preflight_multi_agent_workspace', { snapshotId }),
+  beginMultiAgentWorkspaceRestore: (snapshotId: string, expectedRevision: number) =>
+    invoke<BeginWorkspaceRestoreResult>('begin_multi_agent_workspace_restore', { snapshotId, expectedRevision, rendererInstanceId }),
+  releaseMultiAgentWorkspaceRestore: (attemptId: string) =>
+    invoke<void>('release_multi_agent_workspace_restore', { attemptId }),
+  cancelMultiAgentWorkspacePaneLaunch: (sessionId: string, restoreAttempt: RestoreAttemptRef) =>
+    invoke<void>('cancel_multi_agent_workspace_pane_launch', { sessionId, restoreAttempt }),
   /** Per-session activity for the contribution heatmap.
    *  One entry per session file: { ts: epoch seconds, count: msg lines }.
    *  Frontend buckets ts into local-day boxes for the grid. */
@@ -293,6 +433,17 @@ export const commands = {
     invoke<Record<string, ToolConfigEntry>>('get_all_tool_configs'),
   setToolConfig: (tool: string, entry: ToolConfigEntry) =>
     invoke<void>('set_tool_config', { tool, entry }),
+
+  // ─── Coffee-managed MCP profiles (~/.coffee-cli/mcp.json) ──────────
+  getMcpConfig: () => invoke<McpConfig>('get_mcp_config'),
+  getMcpConfigRecoveryToken: () => invoke<string>('get_mcp_config_recovery_token'),
+  resetInvalidMcpConfig: (expectedToken: string) =>
+    invoke<McpConfig>('reset_invalid_mcp_config', { expectedToken }),
+  getMcpMultiAgentBinding: (workspace: string, pane: number) =>
+    invoke<string | null>('get_mcp_multi_agent_binding', { workspace, pane }),
+  saveMcpConfig: (config: McpConfig) => invoke<McpConfig>('save_mcp_config', { config }),
+  setMcpMultiAgentBinding: (workspace: string, pane: number, mutation: McpMultiAgentBindingMutation) =>
+    invoke<McpConfig>('set_mcp_multi_agent_binding', { workspace, pane, mutation }),
 };
 
 // In-app self-update progress, emitted by download_and_install_update.
@@ -332,4 +483,47 @@ export interface ToolConfigEntry {
   /** Custom directory to scan for this tool's session history files.
    *  Empty falls through to the built-in scan path. */
   history_path: string;
+}
+
+export type McpProfileSelection =
+  | { mode: 'auto' }
+  | { mode: 'none' }
+  | { mode: 'profile'; profile_id: string };
+
+/** A persisted workspace+pane change. This is intentionally separate from
+ * `McpProfileSelection`, where Auto and None are per-run choices. */
+export type McpMultiAgentBindingMutation =
+  | { mode: 'set'; profile_id: string }
+  | { mode: 'clear' };
+
+export interface McpEnvRef {
+  from_env: string;
+}
+
+export type McpTransport =
+  | { type: 'stdio'; command: string; args: string[]; env: Record<string, McpEnvRef> }
+  | { type: 'http'; url: string; headers: Record<string, McpEnvRef> };
+
+export interface McpServerDefinition {
+  name: string;
+  transport: McpTransport;
+  enabled: boolean;
+}
+
+export interface McpProfile {
+  name: string;
+  servers: string[];
+}
+
+export interface McpConfig {
+  version: number;
+  revision: number;
+  servers: Record<string, McpServerDefinition>;
+  profiles: Record<string, McpProfile>;
+  defaults: {
+    global: string | null;
+    agents: Record<string, string | null>;
+  };
+  workspace_bindings: Array<{ workspace: string; profile: string }>;
+  multi_agent_bindings: Array<{ workspace: string; panes: Record<string, string> }>;
 }

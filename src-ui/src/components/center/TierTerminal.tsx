@@ -27,7 +27,7 @@ import { parseCodexTerminalTitle } from '../../lib/codex-terminal-title';
 import { parseGrokTerminalTitle } from '../../lib/grok-terminal-title';
 import { markNotifySoundPromptSubmitted } from '../../lib/notify-sound';
 import { onWindowForeground } from '../../lib/window-focus-filter';
-import { commands } from '../../tauri';
+import { commands, type McpProfileSelection, type RestoreAttemptRef, type WorkspaceCheckpoint } from '../../tauri';
 import { supportsNativeAgentStatus, useAppDispatch, useAppState, type AgentStatus, type ToolType, type ThemeColor } from '../../store/app-state';
 import { useT } from '../../i18n/useT';
 import { getToolDisplayName } from '../../lib/tool-info';
@@ -210,6 +210,27 @@ function buildXtermTheme(themeName: string, hasBg: boolean | undefined, schemeId
 
 // Sessions being detached to a new window — skip kill on unmount
 export const detachedSessions = new Set<string>();
+
+function createTerminalRunId(): string {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === 'function') return cryptoApi.randomUUID();
+
+  // Tauri's supported WebViews provide crypto.randomUUID(), but preserve a
+  // UUID-shaped fallback for older embedded engines so the backend can keep a
+  // single run-id format.
+  const bytes = new Uint8Array(16);
+  if (typeof cryptoApi?.getRandomValues === 'function') {
+    cryptoApi.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 // ─── Terminal Context Menu ────────────────────────────────────────────────────
 
@@ -419,6 +440,19 @@ interface TierTerminalProps {
    *  effect passes it to tierTerminalStart, which spawns the tool with
    *  `--resume <token>` instead of a fresh launch. */
   resumeToken?: string;
+  mcpSelection?: McpProfileSelection;
+  /** Protected topology context for a recoverable multi-agent pane. */
+  workspaceContext?: WorkspaceCheckpoint;
+  /** One backend-issued lease; contains no native CLI resume token. */
+  restoreAttempt?: RestoreAttemptRef;
+  /** Keep a coordinated workspace anchored to its selected project folder. */
+  lockWorkspaceCwd?: boolean;
+  /**
+   * Settles a one-shot workspace launch intent after the backend accepts or
+   * rejects it. `false` keeps the local restore lease pinned because the
+   * backend did not confirm a requested cancellation.
+   */
+  onWorkspaceLaunchSettled?: (accepted: boolean) => boolean | Promise<boolean> | void;
   hasBg?: boolean;
   bgUrl?: string;
   bgType?: 'image' | 'video' | 'none';
@@ -429,8 +463,14 @@ interface TierTerminalProps {
 // ─── Component ───────────────────────────────────────────────────────────────
 
 function TierTerminalImpl({
-  sessionId, tool, toolName, theme, lang, isActive, toolData, folderPath, resumeToken, hasBg, bgUrl, bgType, termColorScheme, termFont,
+  sessionId, tool, toolName, theme, lang, isActive, toolData, folderPath, resumeToken, mcpSelection, workspaceContext, restoreAttempt, lockWorkspaceCwd, onWorkspaceLaunchSettled, hasBg, bgUrl, bgType, termColorScheme, termFont,
 }: TierTerminalProps) {
+  // A pane can restart in place while its prior child is still unwinding. The
+  // initialization effect assigns a fresh ID before each actual launch. A ref
+  // lets separate UI effects address the current run without letting an old
+  // async startup borrow a replacement's ID.
+  const runIdRef = useRef<string | null>(null);
+
   // Raw shells (local terminal / remote SSH) have no TUI painting its own
   // caret — the xterm cursor is the only input-position indicator, so these
   // tabs keep it visible (issue #95). Drives the theme + CSS below.
@@ -516,10 +556,37 @@ function TierTerminalImpl({
     if (!termRef.current || xtermRef.current) return;
 
     let mounted = true;
+    const runId = createTerminalRunId();
+    runIdRef.current = runId;
     const unlisteners: (() => void)[] = [];
+    let workspaceLaunchSettled = false;
+    let workspaceLaunchSettling: Promise<boolean> | null = null;
+    const settleWorkspaceLaunch = (accepted: boolean): Promise<boolean> => {
+      if (workspaceLaunchSettled) return Promise.resolve(true);
+      if (workspaceLaunchSettling) return workspaceLaunchSettling;
+      workspaceLaunchSettling = (async () => {
+        try {
+          const acknowledged = await onWorkspaceLaunchSettled?.(accepted);
+          if (acknowledged === false) return false;
+          workspaceLaunchSettled = true;
+          return true;
+        } catch (error) {
+          console.warn('[TierTerminal] workspace launch settlement failed:', error);
+          return false;
+        } finally {
+          workspaceLaunchSettling = null;
+        }
+      })();
+      return workspaceLaunchSettling;
+    };
 
+    let setupTerm: Terminal | null = null;
+    let setupFit: FitAddon | null = null;
+    let setupUnregisterFocus: (() => void) | null = null;
+    let fontReady: Promise<unknown> = Promise.resolve();
+    try {
     const fontFamily = buildFontFamily(termFont);
-    const term = new Terminal({
+    setupTerm = new Terminal({
       fontFamily,
       fontSize: 14,
       lineHeight: 1.3,
@@ -555,8 +622,8 @@ function TierTerminalImpl({
       theme: buildXtermTheme(theme, hasBg, termColorScheme, isRawShell),
     });
 
-    const fit = new FitAddon();
-    term.loadAddon(fit);
+    setupFit = new FitAddon();
+    setupTerm.loadAddon(setupFit);
 
     // Unicode 11 width tables. xterm's default V6 wcwidth scores common
     // emoji as NARROW (✅ ❌ ⭐ 🚀 = 1 cell) while modern CLI frameworks
@@ -568,8 +635,8 @@ function TierTerminalImpl({
     // "涉及表格就错位 / 错位后不自愈" bug chased blindly in #110/#112.
     // Registering the V11 provider aligns our cell accounting with the
     // apps'. Same reason VS Code loads this addon in its terminal.
-    term.loadAddon(new Unicode11Addon());
-    term.unicode.activeVersion = '11';
+    setupTerm.loadAddon(new Unicode11Addon());
+    setupTerm.unicode.activeVersion = '11';
     // Grapheme-aware widths (Unicode 15 + clustering). Supersedes V11: besides
     // the single-codepoint emoji V11 already widens, this also fixes the
     // multi-codepoint clusters V11 leaves wrong - ZWJ families (👨‍👩‍👧‍👦
@@ -579,7 +646,7 @@ function TierTerminalImpl({
     // this addon experimental, so load best-effort - if it throws we keep the
     // stable V11 provider active instead of crashing terminal init.
     try {
-      term.loadAddon(new UnicodeGraphemesAddon());
+      setupTerm.loadAddon(new UnicodeGraphemesAddon());
     } catch {
       // V11 remains the active unicode provider
     }
@@ -588,13 +655,31 @@ function TierTerminalImpl({
     // CenterPanel handles the global focusin/mouseup listener and routes
     // focus to the active terminal — each tab no longer needs its own pair
     // of window listeners.
-    const unregisterFocus = registerTerminalFocus(sessionId, () => {
+    setupUnregisterFocus = registerTerminalFocus(sessionId, () => {
       xtermRef.current?.focus();
     });
 
     // Wait for CascadiaMono to load before opening the terminal so xterm
     // measures cell metrics with the correct font (avoids box-drawing misalignment).
-    const fontReady = document.fonts.load('14px CascadiaMono').catch(() => {});
+    fontReady = document.fonts.load('14px CascadiaMono').catch(() => {});
+    } catch (err) {
+      try { setupUnregisterFocus?.(); } catch {}
+      try { setupTerm?.dispose(); } catch {}
+      if (runIdRef.current === runId) runIdRef.current = null;
+      console.warn('[TierTerminal] synchronous terminal setup failed:', err);
+      void settleWorkspaceLaunch(false);
+      setStartFailed(true);
+      return;
+    }
+    if (!setupTerm || !setupFit || !setupUnregisterFocus) {
+      if (runIdRef.current === runId) runIdRef.current = null;
+      void settleWorkspaceLaunch(false);
+      setStartFailed(true);
+      return;
+    }
+    const term = setupTerm;
+    const fit = setupFit;
+    const unregisterFocus = setupUnregisterFocus;
     const initTerminal = async () => {
       await fontReady;
       if (!mounted || !termRef.current) return;
@@ -880,7 +965,7 @@ function TierTerminalImpl({
       if (data.includes('\r') || data.includes('\n')) {
         markNotifySoundPromptSubmitted(sessionId, tool);
       }
-      commands.tierTerminalInput(sessionId, data).catch(() => {});
+      commands.tierTerminalInput(sessionId, runId, data).catch(() => {});
     };
     term.onData(forwardInput);
 
@@ -1012,7 +1097,7 @@ function TierTerminalImpl({
         const seq = appCursor
           ? (down ? '\x1bOB' : '\x1bOA')
           : (down ? '\x1b[B' : '\x1b[A');
-        commands.tierTerminalInput(sessionId, seq.repeat(lines)).catch(() => {});
+        commands.tierTerminalInput(sessionId, runId, seq.repeat(lines)).catch(() => {});
         e.preventDefault(); // we own this wheel event — no default browser scroll
         return false; // handled — suppress xterm's no-op scrollback attempt
       } catch {
@@ -1083,7 +1168,7 @@ function TierTerminalImpl({
     // onOutput (subscribed below in startPty) routes through
     // outputScheduler.enqueue instead of term.write directly, so the session
     // must exist first to avoid a dropped-first-chunk race.
-    outputScheduler.registerSession(sessionId, term);
+    outputScheduler.registerSession(sessionId, runId, term);
     // Latency rig OUTPUT STOP: term.onRender is xterm's real render-done
     // signal (better than rAF approximation). Always-on (see latency-rig.ts
     // header); near-zero cost — one performance.now() + bounded ring-buffer
@@ -1102,7 +1187,7 @@ function TierTerminalImpl({
     const syncNativeStatus = (status: AgentStatus) => {
       if (nativeAgentStatusRef.current === status) return;
       nativeAgentStatusRef.current = status;
-      commands.tierTerminalAgentStatus(sessionId, status).catch(() => {});
+      commands.tierTerminalAgentStatus(sessionId, runId, status).catch(() => {});
     };
     const clearGrokPermissionRelease = () => {
       if (grokPermissionReleaseTimerRef.current !== undefined) {
@@ -1176,21 +1261,21 @@ function TierTerminalImpl({
       // Subscribe to PTY events via the singleton bus. One listen() call per
       // event type lives in the bus; we just register per-session handlers
       // into a Map. No N-tab fan-out on hot path.
-      const unsubEvents = await subscribeTerminalEvents(sessionId, {
+      const unsubEvents = await subscribeTerminalEvents(sessionId, runId, {
         onOutput: (data) => {
           if (!mounted) return;
           rig.outputStart();
           hasOutputRef.current = true;
           outputBytesRef.current += data.length;
           lastOutputAtRef.current = Date.now();
-          outputScheduler.enqueue(sessionId, data);
+          outputScheduler.enqueue(sessionId, runId, data);
 
           // Handle SSH Auto-login via Password injection
           if (tool === 'remote' && remoteConfig.protocol === 'ssh' && remoteConfig.password && !hasInjectedPassword) {
             if (data.toLowerCase().includes('password:')) {
               hasInjectedPassword = true;
               setTimeout(() => {
-                commands.tierTerminalRawWrite(sessionId, remoteConfig.password + '\r').catch(() => {});
+                commands.tierTerminalRawWrite(sessionId, runId, remoteConfig.password + '\r').catch(() => {});
               }, 200);
             }
           }
@@ -1205,7 +1290,15 @@ function TierTerminalImpl({
 
         },
         onPeerTask: (event) => {
-          if (!mounted || handledPeerJobsRef.current.has(event.job_id)) return;
+          // The bus keys peer events by target pane + run, but retain this
+          // explicit guard at the consumer boundary. A completion from an old
+          // dispatcher generation must never wake its replacement in place.
+          if (
+            !mounted ||
+            event.target_id !== sessionId ||
+            event.target_run_id !== runId ||
+            handledPeerJobsRef.current.has(event.job_id)
+          ) return;
           const sourceMatch = event.source_id.match(/^(.+)::pane-(\d+)$/);
           const targetMatch = sessionId.match(/^(.+)::pane-(\d+)$/);
           if (!sourceMatch || !targetMatch || sourceMatch[1] !== targetMatch[1]) return;
@@ -1265,8 +1358,14 @@ function TierTerminalImpl({
           if (!mounted) return;
           commands.tierTerminalFailTask(
             sessionId,
+            runId,
             `Peer process exited with code ${exitCode}`,
           ).catch(() => {});
+          // The backend checks runId before cleanup. That makes this
+          // idempotent release safe even when the reader thread is still
+          // handling EOF, while ensuring per-run MCP artifacts do not linger
+          // after a naturally exited process.
+          commands.tierTerminalKill(sessionId, runId).catch(() => {});
           setProcessExited(true);
           if (usesNativeStatus) {
             syncNativeStatus('idle');
@@ -1275,9 +1374,9 @@ function TierTerminalImpl({
         },
         onCwd: (cwd) => {
           if (!mounted) return;
-          dispatch({ type: 'SET_FOLDER', path: cwd });
+          if (!lockWorkspaceCwd) dispatch({ type: 'SET_FOLDER', path: cwd });
         },
-      });
+      }, () => mounted && runIdRef.current === runId);
       if (mounted) unlisteners.push(unsubEvents); else { unsubEvents(); return; }
 
       // All listeners registered — NOW start the PTY process
@@ -1287,15 +1386,38 @@ function TierTerminalImpl({
       const initialRows = term.rows || 24;
 
         try {
-          await commands.tierTerminalStart(sessionId, tool, initialCols, initialRows, theme, lang, toolData, folderPath ?? undefined, resumeToken, appStateRef.current.defaultShell);
+          const accepted = await commands.tierTerminalStart(sessionId, runId, tool, initialCols, initialRows, theme, lang, toolData, folderPath ?? undefined, resumeToken, appStateRef.current.defaultShell, mcpSelection, workspaceContext, restoreAttempt);
+          // The component may have unmounted while invoke() was in flight.
+          // A delayed start must release its own run rather than becoming an
+          // orphan after the replacement already owns this sessionId.
+          if (!mounted) {
+            void settleWorkspaceLaunch(false);
+            commands.tierTerminalKill(sessionId, runId).catch(() => {});
+            return;
+          }
+          if (!accepted) {
+            // Backend cancellation (renderer handoff, an unmounted pending
+            // launch, or a superseded generation) is not a successful pane
+            // start. Settling false releases only this restore permit.
+            void settleWorkspaceLaunch(false);
+            setStartFailed(true);
+            return;
+          }
+          if (!await settleWorkspaceLaunch(true)) {
+            commands.tierTerminalKill(sessionId, runId).catch(() => {});
+            setStartFailed(true);
+            return;
+          }
         } catch (err) {
+          if (!mounted) return;
           // Resume / launch validation failures (missing cwd, bad token
           // format, binary not on PATH) land here. The upstream CLI's own
           // startup errors come through the PTY stream, not this path.
           console.error('[TierTerminal] tierTerminalStart failed', err);
-          if (mounted) {
-            term.write(`\r\n\x1b[31m${String(err)}\x1b[0m\r\n`);
-          }
+          term.write(`\r\n\x1b[31m${String(err)}\x1b[0m\r\n`);
+          void settleWorkspaceLaunch(false);
+          setStartFailed(true);
+          return;
         }
 
         // Continuously report on-screen visibility to the backend so its
@@ -1318,8 +1440,8 @@ function TierTerminalImpl({
             // the WebGL observer's discipline keeps this from firing at all.
             if (!mounted) return;
             const visible = entries.some((e) => e.isIntersecting);
-            commands.setSessionActive(sessionId, visible).catch(() => {});
-            outputScheduler.setActive(sessionId, visible);
+            commands.setSessionActive(sessionId, runId, visible).catch(() => {});
+            outputScheduler.setActive(sessionId, runId, visible);
             // WebGL lifecycle (Orca suspendRendering pattern): release this
             // tab's GL context when hidden so it doesn't hold one of the ~16
             // active-context slots, and re-attach on reveal. The canvasHidden
@@ -1350,23 +1472,31 @@ function TierTerminalImpl({
           fitRef.current.fit();
           const t2 = xtermRef.current;
           if (t2.cols > 0 && t2.rows > 0) {
-            commands.tierTerminalResize(sessionId, t2.cols, t2.rows).catch(() => {});
+            commands.tierTerminalResize(sessionId, runId, t2.cols, t2.rows).catch(() => {});
           }
         }
 
         // Trust prompt is shown to the user directly. Previously auto-skipped,
         // but we want the user to see the real agent screen and decide.
       } catch (err) {
+        if (!mounted) return;
         console.warn('[TierTerminal] startPty failed:', err);
         term.writeln(`\x1b[31mFailed to start terminal: ${err}\x1b[0m`);
-        if (mounted) setStartFailed(true);
+        void settleWorkspaceLaunch(false);
+        setStartFailed(true);
       }
     };
 
     startPty();
     }; // end initTerminal
 
-    initTerminal();
+    void initTerminal().catch((err) => {
+      if (!mounted) return;
+      console.warn('[TierTerminal] initTerminal failed:', err);
+      try { term.writeln(`\x1b[31mFailed to initialize terminal: ${err}\x1b[0m`); } catch {}
+      void settleWorkspaceLaunch(false);
+      setStartFailed(true);
+    });
 
     // Resize observer — CRITICAL: Never call fit() when the container is hidden
     // (display:none gives zero dimensions, causing xterm to collapse to 1 column)
@@ -1394,7 +1524,7 @@ function TierTerminalImpl({
         const cols = term.cols;
         const rows = term.rows;
         if (cols > 0 && rows > 0) {
-          commands.tierTerminalResize(sessionId, cols, rows).catch(() => {});
+          commands.tierTerminalResize(sessionId, runId, cols, rows).catch(() => {});
         }
       } catch {}
     };
@@ -1419,15 +1549,17 @@ function TierTerminalImpl({
         grokPermissionReleaseTimerRef.current = undefined;
       }
       term.dispose();
-      outputScheduler.unregisterSession(sessionId);
+      outputScheduler.unregisterSession(sessionId, runId);
       xtermRef.current = null;
       webglRef.current = null;
       unlisteners.forEach(u => u());
+      if (runIdRef.current === runId) runIdRef.current = null;
       // Skip kill if this session was detached to a new window
       if (detachedSessions.has(sessionId)) {
         detachedSessions.delete(sessionId);
       } else {
-        commands.tierTerminalKill(sessionId).catch(() => {});
+        void settleWorkspaceLaunch(false);
+        commands.tierTerminalKill(sessionId, runId).catch(() => {});
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1516,6 +1648,8 @@ function TierTerminalImpl({
   // TierTerminal tree, so it can't access xtermRef directly — it looks up
   // the active tab's actions in the registry instead.
   useEffect(() => {
+    const runId = runIdRef.current;
+    if (!runId) return;
     let queuedSubmitTimer: ReturnType<typeof setTimeout> | null = null;
     const queuedSubmissions: string[] = [];
 
@@ -1543,7 +1677,7 @@ function TierTerminalImpl({
       term.paste(normalizePasteNewlines(text));
       setTimeout(() => {
         markNotifySoundPromptSubmitted(sessionId, tool);
-        commands.tierTerminalInput(sessionId, '\r').catch(() => {});
+        commands.tierTerminalInput(sessionId, runId, '\r').catch(() => {});
       }, 150);
       return true;
     };
@@ -1641,7 +1775,8 @@ function TierTerminalImpl({
   // only mask when xterm already exists (a real switch-back, not first mount,
   // where the splash covers init and there is no stale frame yet).
   useLayoutEffect(() => {
-    if (!isActive) return;
+    const runId = runIdRef.current;
+    if (!isActive || !runId) return;
     if (xtermRef.current) setCanvasHidden(true);
 
     // Synchronously re-attach WebGL if it was detached on hide. The visibility
@@ -1695,7 +1830,7 @@ function TierTerminalImpl({
         const prev = lastResizeRef.current;
         if (!prev || prev.cols !== term.cols || prev.rows !== term.rows) {
           lastResizeRef.current = { cols: term.cols, rows: term.rows };
-          commands.tierTerminalResize(sessionId, term.cols, term.rows).catch(() => {});
+          commands.tierTerminalResize(sessionId, runId, term.cols, term.rows).catch(() => {});
         }
       });
     });

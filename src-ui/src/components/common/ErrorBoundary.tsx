@@ -4,6 +4,8 @@ interface Props {
   children: ReactNode;
   /** Fallback label shown in recovery UI */
   fallbackLabel?: string;
+  /** Lets a parent settle backend lifecycle state after a child render crash. */
+  onError?: (error: Error, info: ErrorInfo) => void;
 }
 
 interface State {
@@ -23,6 +25,7 @@ export class ErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: Error, info: ErrorInfo) {
     console.error('[HC] Render error caught by ErrorBoundary:', error, info.componentStack);
+    this.props.onError?.(error, info);
   }
 
   handleReset = () => {

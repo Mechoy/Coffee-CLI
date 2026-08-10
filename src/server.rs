@@ -2,13 +2,17 @@ use crate::terminal;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{State, Manager, Emitter};
 use tauri_plugin_dialog::DialogExt;
 
 /// Shared app state
 pub struct AppState {
     pub terminal_session: terminal::SharedSession,
+    /// Launch generation and cancelled-start tombstones for terminal sessions.
+    /// This prevents a delayed async start from creating an orphan after its
+    /// frontend component has already unmounted.
+    pub terminal_launches: terminal::SharedLaunchRegistry,
     /// Structured multi-agent jobs shared by every per-pane MCP endpoint.
     /// Task state lives here rather than in terminal output so a pane's text
     /// cannot forge completion and results survive PTY repainting.
@@ -27,9 +31,8 @@ pub struct AppState {
     /// `self_pane_id` baked in, so `whoami()` / `is_self` in
     /// `list_panes` / identity-bound jobs in `send_to_pane` all
     /// behave deterministically regardless of which CLI is calling.
-    /// Map is keyed by pane id (= terminal session id like
-    /// "tab-X::pane-2"). Closing a pane aborts its listener and removes
-    /// the entry.
+    /// Map is keyed by `(pane id, run id)`. Closing or naturally exiting an
+    /// old generation therefore cannot abort a replacement pane's listener.
     pub pane_mcp_endpoints: tokio::sync::Mutex<
         std::collections::HashMap<String, crate::mcp_server::McpEndpoint>,
     >,
@@ -37,6 +40,58 @@ pub struct AppState {
     /// a (one-time) spawn is in flight so concurrent first-callers
     /// don't race and bind two listeners for the same pane.
     pub mcp_spawn_lock: tokio::sync::Mutex<()>,
+    /// Serializes Coffee's read-modify-write operations on mcp.json. A
+    /// separate revision check rejects stale full-config saves instead of
+    /// allowing a Settings tab to overwrite a newer pane binding.
+    pub mcp_config_lock: Mutex<()>,
+    /// Serializes persistent multi-agent workspace snapshots. This is kept
+    /// separate from mcp_config_lock so a history checkpoint never blocks a
+    /// profile editor (and vice versa).
+    pub multi_agent_workspace_lock: Arc<Mutex<()>>,
+    /// Process-only restore leases and exact `(session_id, run_id)` bindings
+    /// used to safely associate a captured native session token with one pane.
+    pub multi_agent_workspace_runtime:
+        Arc<Mutex<crate::multi_agent_workspace::WorkspaceRuntime>>,
+}
+
+fn normalize_terminal_run_id(run_id: String) -> Result<String, String> {
+    let run_id = run_id.trim();
+    if run_id.is_empty()
+        || run_id.len() > 128
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("Invalid terminal run id".to_string());
+    }
+    Ok(run_id.to_string())
+}
+
+fn finish_terminal_launch(state: &AppState, session_id: &str, run_id: &str) {
+    if let Ok(mut launches) = state.terminal_launches.lock() {
+        launches.finish(session_id, run_id);
+    }
+}
+
+/// A restore permission belongs to one pane, not the whole recovered tab.
+/// Failures before `prepare_terminal_launch` has claimed the permission still
+/// need to retire that pane's pending permit; otherwise its snapshot remains
+/// incorrectly busy after every other pane has stopped.
+fn cancel_pending_restore_pane(
+    state: &AppState,
+    session_id: &str,
+    restore_attempt: Option<&crate::multi_agent_workspace::RestoreAttemptRef>,
+) {
+    let Some(restore_attempt) = restore_attempt else {
+        return;
+    };
+    if let Err(error) = crate::multi_agent_workspace::cancel_restore_pane_launch(
+        &state.multi_agent_workspace_runtime,
+        session_id,
+        restore_attempt,
+    ) {
+        eprintln!("[multi-agent-workspace] failed to cancel pending pane restore: {error}");
+    }
 }
 
 
@@ -659,6 +714,23 @@ fn copy_dir_all(src: &std::path::Path, dest: &std::path::Path) -> std::io::Resul
     Ok(())
 }
 
+/// Resolve the same launch directory for MCP profile lookup and PTY spawn.
+/// A frontend-supplied path has priority even when it later proves stale;
+/// the spawn path preserves the existing fallback-to-home behavior in that
+/// case instead of silently replacing the user's explicit choice.
+fn resolve_launch_cwd(tool: Option<&str>, cwd: Option<&str>) -> PathBuf {
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        return PathBuf::from(cwd);
+    }
+    if let Some(tool) = tool {
+        let configured = crate::tool_config::get(tool).default_cwd;
+        if !configured.trim().is_empty() {
+            return crate::tool_config::expand_path(&configured);
+        }
+    }
+    PathBuf::default()
+}
+
 // ─── Tier Terminal API ────────────────────────────────────────────────────────
 
 /// Multi-agent panes always receive peer-awareness MCP wiring. The per-pane
@@ -667,6 +739,7 @@ fn copy_dir_all(src: &std::path::Path, dest: &std::path::Path) -> std::io::Resul
 #[tauri::command]
 async fn tier_terminal_start(
     session_id: String,
+    run_id: String,
     tool: Option<String>,
     tool_data: Option<String>,
     cols: u16,
@@ -676,9 +749,39 @@ async fn tier_terminal_start(
     cwd: Option<String>,
     resume_token: Option<String>,
     shell: Option<String>,
+    mcp_selection: Option<crate::mcp_config::McpProfileSelection>,
+    workspace_context: Option<crate::multi_agent_workspace::WorkspaceCheckpoint>,
+    restore_attempt: Option<crate::multi_agent_workspace::RestoreAttemptRef>,
+    renderer_instance_id: Option<String>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let run_id = normalize_terminal_run_id(run_id)?;
+    if !state
+        .terminal_launches
+        .lock()
+        .map_err(|error| format!("Launch registry lock poisoned: {error}"))?
+        .reserve(&session_id, &run_id)
+    {
+        // The component unmounted before this delayed IPC request reached the
+        // backend. There is no child to show, so report an explicit rejected
+        // launch rather than letting a still-mounted restore pane ACK success.
+        cancel_pending_restore_pane(&state, &session_id, restore_attempt.as_ref());
+        return Ok(false);
+    }
+
+    // Workspace-managed Claude owns its resume/session selector. Reject an
+    // incompatible local tools.json entry before it can claim a restore lease
+    // or allocate per-pane artifacts; the blocking spawn path repeats this
+    // check so an edit racing this command cannot bypass it.
+    if workspace_context.is_some() && tool.as_deref() == Some("claude") {
+        if let Err(error) = validate_managed_claude_launch_config(&crate::tool_config::get("claude")) {
+            cancel_pending_restore_pane(&state, &session_id, restore_attempt.as_ref());
+            finish_terminal_launch(&state, &session_id, &run_id);
+            return Err(error);
+        }
+    }
+
     // ── Per-pane MCP wiring for multi-agent panes ────────────────────
     // For each multi-agent pane (session id like "tab-X::pane-N")
     // running Claude, Codex, or OpenCode, spawn an MCP server with that
@@ -693,34 +796,155 @@ async fn tier_terminal_start(
     // would redirect the CLI's HOME and break auth.
     //
     // Other tools stay unwired and are not offered by MultiAgentGrid.
-    let mut pane_paths: Option<crate::mcp_injector::PaneConfigPaths> = None;
+    let mut pane_paths: Option<crate::mcp_injector::SessionMcpArtifacts> = None;
     {
         let in_multi_agent = session_id.contains("::pane-");
-        let pane_cli_kind = match tool.as_deref() {
-            Some(k @ ("claude" | "codex" | "opencode"))
-                if in_multi_agent => Some(k),
-            _ => None,
-        };
-        if let Some(kind) = pane_cli_kind {
-            let endpoint = ensure_pane_mcp_running(&state, &session_id, app.clone()).await?;
-            let protocol = crate::multi_agent_protocol::build_pane_system_prompt(&session_id);
-            match crate::mcp_injector::prepare_pane_config_dir(
-                &session_id,
-                kind,
-                &endpoint,
-                &protocol,
-            ) {
-                Ok(paths) => pane_paths = Some(paths),
-                Err(e) => {
-                    cleanup_pane_mcp(&state, &session_id).await;
-                    return Err(format!(
-                        "multi-agent config for {} ({}) failed: {}",
-                        session_id, kind, e
-                    ));
+        let cli_kind = tool
+            .as_deref()
+            .filter(|kind| matches!(*kind, "claude" | "codex" | "opencode"));
+        let selection = mcp_selection.unwrap_or_default();
+        if cli_kind.is_none()
+            && matches!(selection, crate::mcp_config::McpProfileSelection::Profile { .. })
+        {
+            let error = format!(
+                "Tool '{}' does not support Coffee MCP profiles",
+                tool.as_deref().unwrap_or("terminal")
+            );
+            cancel_pending_restore_pane(&state, &session_id, restore_attempt.as_ref());
+            finish_terminal_launch(&state, &session_id, &run_id);
+            return Err(error);
+        }
+        if let Some(kind) = cli_kind {
+            let pane_index = session_id
+                .split_once("::pane-")
+                .and_then(|(_, value)| value.parse::<u8>().ok());
+            let effective_cwd = resolve_launch_cwd(tool.as_deref(), cwd.as_deref());
+            // `None` is the explicit escape hatch when mcp.json is invalid,
+            // from a newer Coffee version, or points at a temporarily missing
+            // integration. Do not even load the external config in that mode;
+            // multi-agent coordination below remains independent and live.
+            let external = if matches!(selection, crate::mcp_config::McpProfileSelection::None)
+            {
+                crate::mcp_config::SessionMcpPlan::default()
+            } else {
+                let config = match crate::mcp_config::load() {
+                    Ok(config) => config,
+                    Err(error) => {
+                        cancel_pending_restore_pane(&state, &session_id, restore_attempt.as_ref());
+                        finish_terminal_launch(&state, &session_id, &run_id);
+                        return Err(error);
+                    }
+                };
+                match crate::mcp_config::resolve_session_plan(
+                    &config,
+                    &selection,
+                    kind,
+                    effective_cwd.to_str(),
+                    pane_index,
+                ) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        cancel_pending_restore_pane(&state, &session_id, restore_attempt.as_ref());
+                        finish_terminal_launch(&state, &session_id, &run_id);
+                        return Err(error);
+                    }
+                }
+            };
+            let endpoint = if in_multi_agent {
+                match ensure_pane_mcp_running(&state, &session_id, &run_id, app.clone()).await {
+                    Ok(endpoint) => Some(endpoint),
+                    Err(error) => {
+                        cancel_pending_restore_pane(&state, &session_id, restore_attempt.as_ref());
+                        cleanup_pane_mcp(&state, &session_id, &run_id).await;
+                        finish_terminal_launch(&state, &session_id, &run_id);
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let protocol = endpoint
+                .as_ref()
+                .map(|_| crate::multi_agent_protocol::build_pane_system_prompt(&session_id));
+            if endpoint.is_some() || !external.servers.is_empty() {
+                match crate::mcp_injector::prepare_session_config_dir(
+                    &session_id,
+                    &run_id,
+                    kind,
+                    endpoint.as_ref().zip(protocol.as_deref()),
+                    &external,
+                ) {
+                    Ok(paths) => pane_paths = Some(paths),
+                    Err(e) => {
+                        cancel_pending_restore_pane(&state, &session_id, restore_attempt.as_ref());
+                        cleanup_pane_mcp(&state, &session_id, &run_id).await;
+                        finish_terminal_launch(&state, &session_id, &run_id);
+                        return Err(format!(
+                            "MCP config for {} ({}) failed: {}",
+                            session_id, kind, e
+                        ));
+                    }
                 }
             }
         }
     }
+
+    if restore_attempt.is_some() && workspace_context.is_none() {
+        cancel_pending_restore_pane(&state, &session_id, restore_attempt.as_ref());
+        cleanup_pane_mcp(&state, &session_id, &run_id).await;
+        finish_terminal_launch(&state, &session_id, &run_id);
+        return Err("A multi-agent restore attempt requires its workspace context".to_string());
+    }
+
+    // A workspace-aware launch checkpoints the current topology before the
+    // PTY exists, then records an exact session/run binding. For a restore,
+    // the backend obtains the resume token from its protected snapshot only
+    // after the lease, layout, cwd, tool, and MCP preflight are still valid.
+    let workspace_launch = if let Some(context) = workspace_context {
+        let Some(renderer_instance_id) = renderer_instance_id.as_deref() else {
+            cancel_pending_restore_pane(&state, &session_id, restore_attempt.as_ref());
+            cleanup_pane_mcp(&state, &session_id, &run_id).await;
+            finish_terminal_launch(&state, &session_id, &run_id);
+            return Err("A multi-agent workspace launch requires Coffee's renderer identity".to_string());
+        };
+        match crate::multi_agent_workspace::prepare_terminal_launch(
+            &state.multi_agent_workspace_lock,
+            &state.multi_agent_workspace_runtime,
+            context,
+            restore_attempt.as_ref(),
+            renderer_instance_id,
+            &session_id,
+            &run_id,
+            tool.as_deref(),
+            cwd.as_deref(),
+        ) {
+            Ok(grant) => Some(grant),
+            Err(error) => {
+                cancel_pending_restore_pane(&state, &session_id, restore_attempt.as_ref());
+                cleanup_pane_mcp(&state, &session_id, &run_id).await;
+                finish_terminal_launch(&state, &session_id, &run_id);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let resume_token = if let Some(grant) = workspace_launch.as_ref() {
+        if resume_token.as_deref().is_some_and(|token| !token.trim().is_empty()) {
+            crate::multi_agent_workspace::rollback_terminal_launch(
+                &state.multi_agent_workspace_lock,
+                &state.multi_agent_workspace_runtime,
+                &session_id,
+                &run_id,
+            );
+            cleanup_pane_mcp(&state, &session_id, &run_id).await;
+            finish_terminal_launch(&state, &session_id, &run_id);
+            return Err("A multi-agent restore token must remain in the backend".to_string());
+        }
+        grant.resume_token.clone()
+    } else {
+        resume_token
+    };
 
     // Offload the whole spawn sequence to a blocking thread so the Tauri
     // command dispatcher returns immediately. Without this, Windows was
@@ -729,24 +953,108 @@ async fn tier_terminal_start(
     // until the spawn returned. Running in the terminal directly avoids
     // this because no IPC layer is involved — the shell forks directly.
     let terminal_session = state.terminal_session.clone();
+    let terminal_launches = state.terminal_launches.clone();
     let cleanup_session_id = session_id.clone();
+    let cleanup_run_id = run_id.clone();
+    let app_for_spawn = app.clone();
+    // A workspace launch keeps its generated Claude UUID solely in backend
+    // memory. Never parse a `Session ID:` string from PTY output: terminal text
+    // is user-controlled and cannot prove which process owns a native session.
+    let managed_claude_session_id = workspace_launch
+        .as_ref()
+        .and_then(|grant| grant.generated_claude_session_id.clone());
+    let workspace_lock_for_spawn = workspace_launch
+        .as_ref()
+        .map(|_| state.multi_agent_workspace_lock.clone());
+    let workspace_runtime_for_spawn = workspace_launch
+        .as_ref()
+        .map(|_| state.multi_agent_workspace_runtime.clone());
+    let should_confirm_managed_claude_identity = managed_claude_session_id.is_some();
+    let replaced_run = {
+        let sessions = state.terminal_session.lock().unwrap();
+        sessions
+            .get(&session_id)
+            .filter(|session| session.run_id != run_id)
+            .map(|session| session.run_id.clone())
+    };
     let result = tauri::async_runtime::spawn_blocking(move || {
         tier_terminal_start_blocking(
-            session_id, tool, tool_data, cols, rows,
-            theme_mode, locale, cwd, resume_token, shell, app,
-            terminal_session, pane_paths,
+            session_id, run_id, tool, tool_data, cols, rows,
+            theme_mode, locale, cwd, resume_token, shell, app_for_spawn,
+            terminal_session, terminal_launches, pane_paths,
+            workspace_lock_for_spawn, workspace_runtime_for_spawn,
+            managed_claude_session_id,
         )
     })
     .await;
     match result {
-        Ok(inner) => {
-            if inner.is_err() {
-                cleanup_pane_mcp(&state, &cleanup_session_id).await;
+        Ok(Ok(true)) => {
+            if let Some(replaced_run) = replaced_run {
+                // `terminal::spawn` atomically installs the replacement in
+                // the session map. The old reader then correctly declines to
+                // remove that new session, which also means it cannot own
+                // backend MCP cleanup any more. Fail its in-flight task
+                // immediately, then release the old generation's listener
+                // and artifacts, both keyed exactly to avoid touching the
+                // replacement's resources.
+                crate::multi_agent_workspace::release_terminal_run(
+                    &state.multi_agent_workspace_lock,
+                    &state.multi_agent_workspace_runtime,
+                    &cleanup_session_id,
+                    &replaced_run,
+                );
+                if let Some(event) = state
+                    .multi_agent_tasks
+                    .fail_target(
+                        &cleanup_session_id,
+                        &replaced_run,
+                        "peer pane restarted".to_string(),
+                    )
+                {
+                    let _ = app.emit("multi-agent-task-complete", event);
+                }
+                cleanup_pane_mcp(&state, &cleanup_session_id, &replaced_run).await;
             }
-            inner
+            if should_confirm_managed_claude_identity {
+                schedule_managed_claude_identity_confirmation(
+                    &state,
+                    cleanup_session_id.clone(),
+                    cleanup_run_id.clone(),
+                );
+            }
+            Ok(true)
+        }
+        Ok(Ok(false)) => {
+            crate::multi_agent_workspace::rollback_terminal_launch(
+                &state.multi_agent_workspace_lock,
+                &state.multi_agent_workspace_runtime,
+                &cleanup_session_id,
+                &cleanup_run_id,
+            );
+            finish_terminal_launch(&state, &cleanup_session_id, &cleanup_run_id);
+            cleanup_pane_mcp(&state, &cleanup_session_id, &cleanup_run_id).await;
+            Ok(false)
+        }
+        Ok(Err(error)) => {
+            crate::multi_agent_workspace::rollback_terminal_launch(
+                &state.multi_agent_workspace_lock,
+                &state.multi_agent_workspace_runtime,
+                &cleanup_session_id,
+                &cleanup_run_id,
+            );
+            finish_terminal_launch(&state, &cleanup_session_id, &cleanup_run_id);
+            cleanup_pane_mcp(&state, &cleanup_session_id, &cleanup_run_id).await;
+            Err(error)
         }
         Err(e) => {
-            cleanup_pane_mcp(&state, &cleanup_session_id).await;
+            crate::multi_agent_workspace::rollback_terminal_launch(
+                &state.multi_agent_workspace_lock,
+                &state.multi_agent_workspace_runtime,
+                &cleanup_session_id,
+                &cleanup_run_id,
+            );
+            finish_terminal_launch(&state, &cleanup_session_id, &cleanup_run_id);
+            cleanup_pane_mcp(&state, &cleanup_session_id, &cleanup_run_id).await;
             Err(format!("Spawn task join failed: {e}"))
         }
     }
@@ -754,6 +1062,7 @@ async fn tier_terminal_start(
 
 fn tier_terminal_start_blocking(
     session_id: String,
+    run_id: String,
     tool: Option<String>,
     tool_data: Option<String>,
     cols: u16,
@@ -765,8 +1074,12 @@ fn tier_terminal_start_blocking(
     shell: Option<String>,
     app: tauri::AppHandle,
     terminal_session: terminal::SharedSession,
-    pane_paths: Option<crate::mcp_injector::PaneConfigPaths>,
-) -> Result<(), String> {
+    terminal_launches: terminal::SharedLaunchRegistry,
+    pane_paths: Option<crate::mcp_injector::SessionMcpArtifacts>,
+    workspace_lock: Option<Arc<Mutex<()>>>,
+    workspace_runtime: Option<Arc<Mutex<crate::multi_agent_workspace::WorkspaceRuntime>>>,
+    managed_claude_session_id: Option<String>,
+) -> Result<bool, String> {
     // CWD resolution order (first non-empty wins):
     //   1. cwd passed from the frontend (launchpad's folder picker / per-tab cwd)
     //   2. tool_config.default_cwd from ~/.coffee-cli/tools.json (WSL-type users
@@ -777,19 +1090,7 @@ fn tier_terminal_start_blocking(
     // tool_config.default_cwd is the always-on fallback for users who don't
     // want to pick each time (or whose launchpad-side path can't address the
     // tool's actual workspace, e.g. WSL).
-    let frontend_cwd = cwd.clone().unwrap_or_default();
-    let dir = if !frontend_cwd.is_empty() {
-        std::path::PathBuf::from(frontend_cwd)
-    } else if let Some(name) = tool.as_deref() {
-        let cfg_cwd = crate::tool_config::get(name).default_cwd;
-        if cfg_cwd.is_empty() {
-            std::path::PathBuf::default()
-        } else {
-            std::path::PathBuf::from(cfg_cwd)
-        }
-    } else {
-        std::path::PathBuf::default()
-    };
+    let dir = resolve_launch_cwd(tool.as_deref(), cwd.as_deref());
 
     // ── Multi-agent auto-approval ────────────────────────────────────────
     // Multi-agent pane session ids look like `${tabId}::pane-N`. When a
@@ -819,92 +1120,12 @@ fn tier_terminal_start_blocking(
     // `remote` parses tool_data at runtime, the shell is platform-derived.
     let registry_descriptor = tool.as_deref().and_then(crate::tools::find);
     let (cmd, args): (String, Vec<String>) = match (tool.as_deref(), registry_descriptor) {
-        (Some(id), Some(descriptor)) => {
-            let mut a: Vec<String> = descriptor
+        (Some(_id), Some(descriptor)) => {
+            let a: Vec<String> = descriptor
                 .default_args
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
-            if in_multi_agent {
-                match id {
-                    "claude" => {
-                        // Let the agent use tools without human approval.
-                        // MCP's whoami / list_panes / send_to_pane /
-                        // complete_task / read_pane give it identity-bound
-                        // discovery, dispatch, completion, and result reads.
-                        a.push("--dangerously-skip-permissions".to_string());
-                        // Per-pane MCP config: this Claude session points
-                        // at its OWN MCP server (with `self_pane_id`
-                        // baked in) so `whoami()` returns deterministic
-                        // answers and `list_panes()` marks `is_self:
-                        // true` on the matching row. Claude merges this
-                        // on top of any user-managed `~/.claude.json`
-                        // mcpServers entries.
-                        if let Some(p) = pane_paths
-                            .as_ref()
-                            .and_then(|pp| pp.claude_mcp_config_path.as_ref())
-                        {
-                            a.push("--mcp-config".to_string());
-                            a.push(p.display().to_string());
-                            // Per-pane system prompt: bake the pane id
-                            // and protocol cheat sheet into THIS Claude
-                            // session's system prompt. Survives /clear
-                            // and /compact. Replaces writing CLAUDE.md
-                            // to the workspace, so multi-agent Claude
-                            // users see ZERO files appear in their
-                            // project directory. It is paired with the MCP
-                            // config above so the prompt only describes
-                            // tools that are actually wired into the pane.
-                            a.push("--append-system-prompt".to_string());
-                            a.push(crate::multi_agent_protocol::build_pane_system_prompt(
-                                &session_id,
-                            ));
-                        }
-                    }
-                    "codex" => {
-                        // Hands-free multi-agent: no human is present to
-                        // click through confirmation dialogs (the
-                        // originating pane's LLM dispatched this work
-                        // via send_to_pane). The earlier conservative
-                        // `-s workspace-write -a never` combo still
-                        // surfaced sandbox-violation prompts for
-                        // cross-workspace ops, login/trust dialogs, and
-                        // first-run consent screens that block the
-                        // PTY. Codex's own "skip everything" door is
-                        // `--dangerously-bypass-approvals-and-sandbox` —
-                        // the doc explicitly reads "Skip all
-                        // confirmation prompts and execute commands
-                        // without sandboxing." That's the right
-                        // tradeoff for multi-agent mode: entering it
-                        // already delegates trust to the controlling
-                        // pane's LLM.
-                        a.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-                        // Per-pane MCP wiring via Codex's `-c
-                        // key=value` config override (it merges onto
-                        // `~/.codex/config.toml` rather than replacing
-                        // it, so user MCP entries / API keys / auth all
-                        // stay live). Two pairs:
-                        //   `mcp_servers.coffee-cli.url='<per-pane-url>'`
-                        //   `model_instructions_file='<pane-temp>/inst.md'`
-                        // The instructions file holds the multi-agent
-                        // protocol body (same text Claude gets via
-                        // --append-system-prompt) and Codex bakes it
-                        // into the model's session context. Both the
-                        // URL and instructions path are unique per
-                        // pane, so 4× same-CLI panes still get
-                        // distinct identity.
-                        if let Some(extra) =
-                            pane_paths.as_ref().map(|pp| pp.codex_extra_args.clone())
-                        {
-                            a.extend(extra);
-                        }
-                    }
-                    // Other registered tools have no multi-agent flag
-                    // set today — they spawn with default_args inside
-                    // a multi-agent pane just like outside one.
-                    _ => {}
-                }
-            }
             (descriptor.binary_name.to_string(), a)
         }
         (Some("remote"), _) => {
@@ -1034,6 +1255,18 @@ fn tier_terminal_start_blocking(
         (cmd, args)
     };
 
+    // Session-owned flags are appended after Fresh/Resume has selected the
+    // base command. The old order built MCP flags first and then discarded
+    // them when Resume rebuilt argv.
+    let mut args = args;
+    append_session_mcp_args(
+        &mut args,
+        tool.as_deref(),
+        in_multi_agent,
+        pane_paths.as_ref(),
+        &session_id,
+    );
+
     // ── User-configurable launch overrides ─────────────────────────────────
     // ~/.coffee-cli/tools.json lets users say e.g. "always launch claude with
     // --dangerously-skip-permissions" or "run codex through `docker exec mybox`".
@@ -1042,6 +1275,9 @@ fn tier_terminal_start_blocking(
     let (cmd, args) = match tool.as_deref() {
         Some(name) if name == "terminal" || crate::tools::find(name).is_some() => {
             let entry = crate::tool_config::get(name);
+            if managed_claude_session_id.is_some() && name == "claude" {
+                validate_managed_claude_launch_config(&entry)?;
+            }
             let (cmd, mut args) = (cmd, args);
             let (cmd, args) = if let (Some(bin), prefix_args) =
                 crate::tool_config::parse_command(&entry.command)
@@ -1067,18 +1303,16 @@ fn tier_terminal_start_blocking(
         // intentionally bypass user override.
         _ => (cmd, args),
     };
-
-    // If a session with the same ID already exists (e.g. restart-in-place),
-    // forcefully kill and remove it before spawning a fresh one.
-    {
-        let mut lock = terminal_session.lock().unwrap();
-        if let Some(old_session) = lock.remove(&session_id) {
-            eprintln!("[Tier Terminal] Killing existing session {} for restart", session_id);
-            let _ = old_session.kill_tx.send(());
-            // Brief pause to let the OS reclaim PTY resources
-            drop(lock);
-            std::thread::sleep(std::time::Duration::from_millis(200));
+    let (cmd, mut args) = (cmd, args);
+    if let Some(session_id) = managed_claude_session_id {
+        if tool.as_deref() != Some("claude") {
+            return Err("Coffee generated a Claude session identity for a non-Claude pane".to_string());
         }
+        // Put Coffee's verified identity after user configuration. Workspace
+        // Claude config rejects every session selector below, so this is the
+        // sole authority that can choose the fresh native session.
+        args.push("--session-id".to_string());
+        args.push(session_id);
     }
 
     // Determine the CWD to pass to the Agent:
@@ -1093,13 +1327,24 @@ fn tier_terminal_start_blocking(
     let tool_name = tool.clone();
     let actual_cwd = spawn_cwd.clone().unwrap_or_default();
 
-    eprintln!("[Tier Terminal] Starting tool={:?}, cmd={}, args={:?}, cwd={:?}", tool, cmd, args, spawn_cwd);
+    // Arguments can contain native `--resume` identities or user-provided
+    // secrets. Keep launch diagnostics useful without writing either to logs.
+    eprintln!(
+        "[Tier Terminal] Starting tool={:?}, cmd={}, arg_count={}, cwd={:?}",
+        tool,
+        cmd,
+        args.len(),
+        spawn_cwd
+    );
 
     // Per-pane env overrides. OpenCode loads OPENCODE_CONFIG_CONTENT last,
     // after project config, so its pane-specific endpoint cannot be replaced.
     // Every supported multi-agent CLI also receives a private temporary
     // directory for long result artifacts that cannot fit in read_pane.
-    let mut extra_env: Vec<(String, String)> = Vec::new();
+    let mut extra_env: Vec<(String, String)> = pane_paths
+        .as_ref()
+        .map(|artifacts| artifacts.extra_env.clone())
+        .unwrap_or_default();
     if let Some(content) = pane_paths
         .as_ref()
         .and_then(|pp| pp.opencode_config_content.as_ref())
@@ -1116,41 +1361,210 @@ fn tier_terminal_start_blocking(
         ));
     }
 
-    terminal::spawn(
-        app.clone(),
-        session_id.clone(),
-        terminal_session.clone(),
-        cmd,
-        args,
-        spawn_cwd,
-        locale.clone().unwrap_or_else(|| "en".to_string()),
-        cols,
-        rows,
-        tool_name.clone(),
-        theme_mode,
-        locale,
-        extra_env,
-    ).map_err(|e| format!("Failed to spawn PTY: {}", e))?;
+    if workspace_lock.is_some() != workspace_runtime.is_some() {
+        return Err("Multi-agent launch fence was configured incompletely".to_string());
+    }
+    let spawned = {
+        // Hold this lock across the final terminal installation and workspace
+        // commit. Renderer replacement uses the same fence, so it can only
+        // retire a run before installation or after its snapshot is durable.
+        let _workspace_guard = workspace_lock
+            .as_ref()
+            .map(|lock| {
+                lock.lock()
+                    .map_err(|_| "Multi-agent workspace lock was poisoned".to_string())
+            })
+            .transpose()?;
+        let spawned = terminal::spawn(
+            app.clone(),
+            session_id.clone(),
+            run_id.clone(),
+            terminal_session.clone(),
+            terminal_launches,
+            cmd,
+            args,
+            spawn_cwd,
+            locale.clone().unwrap_or_else(|| "en".to_string()),
+            cols,
+            rows,
+            tool_name.clone(),
+            theme_mode,
+            locale,
+            extra_env,
+            None,
+        )
+        .map_err(|e| format!("Failed to spawn PTY: {}", e))?;
+        if spawned {
+            if let Some(runtime) = workspace_runtime.as_ref() {
+                crate::multi_agent_workspace::commit_terminal_launch_while_workspace_locked(
+                    runtime,
+                    &session_id,
+                    &run_id,
+                )?;
+            }
+        }
+        spawned
+    };
+    if !spawned {
+        return Ok(false);
+    }
 
     // Emit the initial CWD to the frontend so the left panel can map immediately.
     // On Windows, cmd.exe does not emit OSC 7, and full-screen agents enter alt-screen
     // before any shell prompt appears. This one-time emit bridges the gap.
     if !actual_cwd.is_empty() {
         #[derive(serde::Serialize, Clone)]
-        struct CwdPayload { id: String, cwd: String }
+        struct CwdPayload {
+            id: String,
+            run_id: String,
+            cwd: String,
+        }
         let _ = app.emit("tier-terminal-cwd", CwdPayload {
             id: session_id,
+            run_id,
             cwd: actual_cwd,
         });
     }
 
+    Ok(true)
+}
+
+/// Append session-owned flags only after Fresh/Resume has built its base argv.
+/// Keeping this separate makes the ordering testable: resume positional
+/// arguments must stay intact while MCP configuration is still applied.
+fn append_session_mcp_args(
+    args: &mut Vec<String>,
+    tool: Option<&str>,
+    in_multi_agent: bool,
+    artifacts: Option<&crate::mcp_injector::SessionMcpArtifacts>,
+    session_id: &str,
+) {
+    if in_multi_agent {
+        match tool {
+            Some("claude") => args.push("--dangerously-skip-permissions".to_string()),
+            Some("codex") => args.push("--dangerously-bypass-approvals-and-sandbox".to_string()),
+            _ => {}
+        }
+    }
+    match tool {
+        Some("claude") => {
+            if let Some(path) = artifacts.and_then(|value| value.claude_mcp_config_path.as_ref()) {
+                args.push("--mcp-config".to_string());
+                args.push(path.display().to_string());
+                if in_multi_agent {
+                    args.push("--append-system-prompt".to_string());
+                    args.push(crate::multi_agent_protocol::build_pane_system_prompt(session_id));
+                }
+            }
+        }
+        Some("codex") => {
+            if let Some(extra) = artifacts.map(|value| &value.codex_extra_args) {
+                args.extend(extra.iter().cloned());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_managed_claude_session_selector(argument: &str) -> bool {
+    matches!(
+        argument,
+        "--"
+            | "-r"
+            | "--resume"
+            | "-c"
+            | "--continue"
+            | "--session-id"
+            | "--fork-session"
+            | "--no-session-persistence"
+    ) || [
+        "--resume=",
+        "--continue=",
+        "--session-id=",
+        "--fork-session=",
+        "--no-session-persistence=",
+    ]
+    .iter()
+    .any(|prefix| argument.starts_with(prefix))
+}
+
+/// Coffee must be the only component selecting a native Claude identity for a
+/// recoverable workspace pane. Other launch flags remain configurable.
+fn validate_managed_claude_launch_config(
+    entry: &crate::tool_config::ToolConfigEntry,
+) -> Result<(), String> {
+    let (_, prefix_args) = crate::tool_config::parse_command(&entry.command);
+    if prefix_args
+        .iter()
+        .chain(entry.extra_args.iter())
+        .any(|argument| is_managed_claude_session_selector(argument))
+    {
+        return Err(
+            "Coffee-managed Claude workspace panes cannot set resume, continue, session-id, fork-session, persistence, or `--` launch arguments in tools.json"
+                .to_string(),
+        );
+    }
     Ok(())
+}
+
+/// Native Claude history is written asynchronously. Retry briefly after a
+/// Coffee-managed fresh launch (and again after a submitted prompt) without
+/// reading any identity from terminal output. The workspace runtime deduplicates
+/// overlapping retries for the exact generation.
+fn schedule_managed_claude_identity_confirmation(
+    state: &AppState,
+    session_id: String,
+    run_id: String,
+) {
+    if !crate::multi_agent_workspace::begin_managed_claude_identity_confirmation(
+        &state.multi_agent_workspace_runtime,
+        &session_id,
+        &run_id,
+    ) {
+        return;
+    }
+    let lock = state.multi_agent_workspace_lock.clone();
+    let runtime = state.multi_agent_workspace_runtime.clone();
+    std::thread::spawn(move || {
+        let mut last_error = None;
+        for attempt in 0..8 {
+            match crate::multi_agent_workspace::confirm_generated_claude_identity(
+                &lock,
+                &runtime,
+                &session_id,
+                &run_id,
+            ) {
+                Ok(true) => {
+                    crate::multi_agent_workspace::finish_managed_claude_identity_confirmation(
+                        &runtime,
+                        &session_id,
+                        &run_id,
+                    );
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < 7 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+        crate::multi_agent_workspace::finish_managed_claude_identity_confirmation(
+            &runtime,
+            &session_id,
+            &run_id,
+        );
+        if let Some(error) = last_error {
+            eprintln!("[multi-agent-workspace] managed Claude identity confirmation failed: {error}");
+        }
+    });
 }
 
 
 #[tauri::command]
 fn tier_terminal_input(
     session_id: String,
+    run_id: String,
     data: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -1158,8 +1572,12 @@ fn tier_terminal_input(
     let (writer_arc, activity_arc) = {
         let map = state.terminal_session.lock().unwrap();
         match map.get(&session_id) {
-            Some(session) => (session.writer_lock.clone(), session.activity.clone()),
-            None => return Err(format!("No active terminal session for id: {}", session_id)),
+            Some(session) if session.run_id == run_id => {
+                (session.writer_lock.clone(), session.activity.clone())
+            }
+            // A late callback from a replaced/unmounted terminal is expected.
+            // It must never write to the replacement PTY with the same id.
+            _ => return Ok(()),
         }
     };
     // Map lock released — other tabs can now proceed concurrently
@@ -1167,7 +1585,8 @@ fn tier_terminal_input(
     // Reserve the pane as busy before the PTY write. This closes the small
     // race where a peer dispatch could otherwise pass its readiness check
     // after Enter was pressed but before the submitted prompt reached the CLI.
-    if data.contains('\r') || data.contains('\n') {
+    let submitted_prompt = data.contains('\r') || data.contains('\n');
+    if submitted_prompt {
         if let Ok(mut activity) = activity_arc.lock() {
             activity.mark_working();
             if activity.native_status.is_some() {
@@ -1186,6 +1605,10 @@ fn tier_terminal_input(
         .map_err(|e| format!("Write failed: {}", e))?;
     w.flush().map_err(|e| format!("Flush failed: {}", e))?;
 
+    if submitted_prompt {
+        schedule_managed_claude_identity_confirmation(&state, session_id, run_id);
+    }
+
     Ok(())
 }
 
@@ -1194,6 +1617,7 @@ fn tier_terminal_input(
 #[tauri::command]
 fn tier_terminal_agent_status(
     session_id: String,
+    run_id: String,
     status: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -1203,8 +1627,8 @@ fn tier_terminal_agent_status(
     let activity = {
         let map = state.terminal_session.lock().unwrap();
         match map.get(&session_id) {
-            Some(session) => session.activity.clone(),
-            None => return Err(format!("No active terminal session for id: {session_id}")),
+            Some(session) if session.run_id == run_id => session.activity.clone(),
+            _ => return Ok(()),
         }
     };
     let mut activity = activity
@@ -1220,11 +1644,23 @@ fn tier_terminal_agent_status(
 #[tauri::command]
 fn tier_terminal_fail_task(
     session_id: String,
+    run_id: String,
     reason: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if let Some(event) = state.multi_agent_tasks.fail_target(&session_id, reason) {
+    let owns_current_session = crate::terminal::deactivate_session_generation(
+        &state.terminal_session,
+        &session_id,
+        &run_id,
+    );
+    if !owns_current_session {
+        return Ok(());
+    }
+    if let Some(event) = state
+        .multi_agent_tasks
+        .fail_target(&session_id, &run_id, reason)
+    {
         app.emit("multi-agent-task-complete", event)
             .map_err(|error| format!("task failure event emit failed: {error}"))?;
     }
@@ -1236,6 +1672,7 @@ fn tier_terminal_fail_task(
 #[tauri::command]
 fn tier_terminal_raw_write(
     session_id: String,
+    run_id: String,
     data: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -1243,8 +1680,8 @@ fn tier_terminal_raw_write(
     let writer_arc = {
         let map = state.terminal_session.lock().unwrap();
         match map.get(&session_id) {
-            Some(s) => s.writer_lock.clone(),
-            None => return Err(format!("No active terminal session for id: {}", session_id)),
+            Some(session) if session.run_id == run_id => session.writer_lock.clone(),
+            _ => return Ok(()),
         }
     };
 
@@ -1275,10 +1712,17 @@ fn set_background_mode(hidden: bool) {
 /// No-op if the session doesn't exist yet (frontend can fire before the PTY
 /// finishes spawning) or has already been killed.
 #[tauri::command]
-fn set_session_active(session_id: String, active: bool, state: State<'_, AppState>) -> Result<(), String> {
+fn set_session_active(
+    session_id: String,
+    run_id: String,
+    active: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let map = state.terminal_session.lock().unwrap();
     if let Some(session) = map.get(&session_id) {
-        session.is_tab_active.store(active, std::sync::atomic::Ordering::Relaxed);
+        if session.run_id == run_id {
+            session.is_tab_active.store(active, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     Ok(())
 }
@@ -1286,29 +1730,75 @@ fn set_session_active(session_id: String, active: bool, state: State<'_, AppStat
 #[tauri::command]
 async fn tier_terminal_kill(
     session_id: String,
+    run_id: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if let Some(event) = state
-        .multi_agent_tasks
-        .fail_target(&session_id, "peer pane was stopped".to_string())
+    stop_terminal_generation(&state, &app, &session_id, &run_id, "peer pane was stopped").await
+}
+
+/// Stop one exact terminal generation. Both explicit UI teardown and a
+/// renderer replacement use this path so MCP listeners, task records, launch
+/// tombstones, and workspace leases always settle together.
+async fn stop_terminal_generation(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    session_id: &str,
+    run_id: &str,
+    task_failure_reason: &str,
+) -> Result<(), String> {
+    // Revoke a recovery token binding before signalling the child. A late
+    // reader flush from this run must never overwrite a later pane selection
+    // or a replacement PTY's token.
+    crate::multi_agent_workspace::release_terminal_run(
+        &state.multi_agent_workspace_lock,
+        &state.multi_agent_workspace_runtime,
+        session_id,
+        run_id,
+    );
     {
-        let _ = app.emit("multi-agent-task-complete", event);
+        // Cancel before looking up the live session so a delayed spawn sees
+        // the tombstone. Release the registry before any session operation:
+        // replacement now takes its generation gate before the map.
+        let mut launches = state
+            .terminal_launches
+            .lock()
+            .map_err(|error| format!("Launch registry lock poisoned: {error}"))?;
+        launches.cancel(session_id, run_id);
     }
     let kill_tx = {
         let map = state.terminal_session.lock().unwrap();
-        map.get(&session_id).map(|session| session.kill_tx.clone())
+        map.get(session_id)
+            .filter(|session| session.run_id == run_id)
+            .map(|session| {
+                // Do not wait for the generation gate while holding the
+                // session map. Sending this signal can be what unblocks a
+                // back-pressured target PTY write.
+                session
+                    .run_is_live
+                    .store(false, std::sync::atomic::Ordering::Release);
+                session.kill_tx.clone()
+            })
     };
+    if kill_tx.is_some() {
+        if let Some(event) = state
+            .multi_agent_tasks
+            .fail_target(session_id, run_id, task_failure_reason.to_string())
+        {
+            let _ = app.emit("multi-agent-task-complete", event);
+        }
+    }
     if let Some(kill_tx) = kill_tx {
         let _ = kill_tx.send(());
     }
-    cleanup_pane_mcp(&state, &session_id).await;
+    cleanup_pane_mcp(state, session_id, run_id).await;
     Ok(())
 }
 
 #[tauri::command]
 fn tier_terminal_resize(
     session_id: String,
+    run_id: String,
     cols: u16,
     rows: u16,
     state: State<'_, AppState>,
@@ -1316,15 +1806,17 @@ fn tier_terminal_resize(
     use portable_pty::PtySize;
     let map = state.terminal_session.lock().unwrap();
     if let Some(session) = map.get(&session_id) {
-        let master_guard = session._master.lock().unwrap();
-        if let Some(ref master) = *master_guard {
-            let size = PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            };
-            master.resize(size).map_err(|e| format!("Resize failed: {}", e))?;
+        if session.run_id == run_id {
+            let master_guard = session._master.lock().unwrap();
+            if let Some(ref master) = *master_guard {
+                let size = PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                };
+                master.resize(size).map_err(|e| format!("Resize failed: {}", e))?;
+            }
         }
     }
     Ok(())
@@ -1342,6 +1834,69 @@ struct SavedSession {
     saved_at: String,
     file_path: Option<String>,
     turn_count: Option<u32>,
+}
+
+/// Minimal native-history identity held only inside Coffee's recovery backend.
+/// Native ids frequently embed the resume token, so neither this type nor its
+/// ids are returned to the WebView.
+#[derive(Clone)]
+pub(crate) struct NativeHistoryCandidate {
+    pub id: String,
+    pub name: String,
+    pub tool: String,
+    pub cwd: String,
+    pub session_token: Option<String>,
+    pub saved_at: String,
+    pub turn_count: Option<u32>,
+}
+
+fn native_history_candidate_from_session(session: SavedSession) -> NativeHistoryCandidate {
+    NativeHistoryCandidate {
+        id: session.id,
+        name: session.name,
+        tool: session.tool,
+        cwd: session.cwd,
+        session_token: session.session_token,
+        saved_at: session.saved_at,
+        turn_count: session.turn_count,
+    }
+}
+
+/// Recovery must not inherit the history board's global 200-entry cap. This
+/// loader searches only the requested coordinated tool and canonical workspace.
+pub(crate) fn native_history_candidates_for_workspace(
+    tool: &str,
+    workspace: &str,
+) -> Result<Vec<NativeHistoryCandidate>, String> {
+    Ok(load_native_history_for_workspace_blocking(tool, workspace, None)?
+        .into_iter()
+        .map(native_history_candidate_from_session)
+        .collect())
+}
+
+pub(crate) fn native_history_candidates_for_workspace_picker(
+    tool: &str,
+    workspace: &str,
+) -> Result<Vec<NativeHistoryCandidate>, String> {
+    Ok(load_native_history_for_workspace_blocking(
+        tool,
+        workspace,
+        Some(RECOVERY_HISTORY_PICKER_LIMIT),
+    )?
+    .into_iter()
+    .map(native_history_candidate_from_session)
+    .collect())
+}
+
+pub(crate) fn native_history_candidate_for_workspace(
+    tool: &str,
+    workspace: &str,
+    candidate_id: &str,
+) -> Result<Option<NativeHistoryCandidate>, String> {
+    let session = native_history_candidates_for_workspace(tool, workspace)?
+        .into_iter()
+        .find(|session| session.id == candidate_id);
+    Ok(session)
 }
 
 /// XML-style tags injected into the user message stream by Claude /
@@ -1493,6 +2048,152 @@ fn load_claude_project_map(home: &std::path::Path) -> std::collections::HashMap<
         }
     }
     map
+}
+
+/// Verify a Coffee-generated Claude UUID without using the generic history
+/// parser. The ordinary history board intentionally hides zero-real-user
+/// sessions (Claude compaction artifacts); this narrow path instead knows the
+/// exact UUID Coffee launched and accepts a newly created JSONL only when its
+/// native location and workspace identity agree exactly.
+pub(crate) fn claude_history_has_exact_session(
+    workspace: &str,
+    expected_session_id: &str,
+) -> Result<bool, String> {
+    let expected_session_id = uuid::Uuid::parse_str(expected_session_id)
+        .map_err(|_| "Invalid Coffee-managed Claude session identity".to_string())?
+        .to_string();
+    let workspace = crate::multi_agent_workspace::normalize_workspace(workspace)?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| "Could not determine the user home directory".to_string())?;
+    let descriptor = crate::tools::find("claude")
+        .ok_or_else(|| "Claude tool descriptor is unavailable".to_string())?;
+    let shape = descriptor
+        .history_shape
+        .as_ref()
+        .ok_or_else(|| "Claude does not expose native history".to_string())?;
+    if shape.jsonl_depth() != Some(2) {
+        return Err("Claude native history layout is not supported by this Coffee version".to_string());
+    }
+    let root = crate::tool_config::history_path_for(descriptor.id, shape.join_under(&home));
+    let project_map = load_claude_project_map(&home);
+    claude_history_has_exact_session_in_root(
+        &root,
+        &project_map,
+        &workspace,
+        &expected_session_id,
+    )
+}
+
+fn claude_history_has_exact_session_in_root(
+    root: &std::path::Path,
+    project_map: &std::collections::HashMap<String, String>,
+    workspace: &str,
+    expected_session_id: &str,
+) -> Result<bool, String> {
+    let buckets = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "Could not read Claude native history at {}: {error}",
+                root.display()
+            ))
+        }
+    };
+    for bucket in buckets {
+        let bucket = bucket.map_err(|error| format!("Could not inspect Claude native history: {error}"))?;
+        let file_type = bucket
+            .file_type()
+            .map_err(|error| format!("Could not inspect Claude native history entry: {error}"))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let Some(bucket_name) = bucket.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let candidate = bucket.path().join(format!("{expected_session_id}.jsonl"));
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect Claude session {}: {error}",
+                    candidate.display()
+                ))
+            }
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        if claude_exact_session_file_matches(
+            &candidate,
+            &bucket_name,
+            project_map,
+            workspace,
+            expected_session_id,
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn claude_exact_session_file_matches(
+    path: &std::path::Path,
+    bucket_name: &str,
+    project_map: &std::collections::HashMap<String, String>,
+    workspace: &str,
+    expected_session_id: &str,
+) -> Result<bool, String> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("Could not read Claude session {}: {error}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let mut saw_valid_record = false;
+    let mut saw_cwd = false;
+    for line in reader.lines() {
+        let line = line.map_err(|error| format!("Could not read Claude session {}: {error}", path.display()))?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        saw_valid_record = true;
+        if let Some(session_id) = value.get("sessionId").and_then(|value| value.as_str()) {
+            if !session_id.is_empty() && session_id != expected_session_id {
+                return Ok(false);
+            }
+        }
+        if let Some(cwd) = value.get("cwd").and_then(|value| value.as_str()) {
+            if !cwd.is_empty() {
+                saw_cwd = true;
+                let Ok(candidate_workspace) = crate::multi_agent_workspace::normalize_workspace(
+                    &project_root_from_cwd(cwd),
+                ) else {
+                    return Ok(false);
+                };
+                if candidate_workspace != workspace {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    if !saw_valid_record {
+        return Ok(false);
+    }
+    if saw_cwd {
+        return Ok(true);
+    }
+
+    // Older Claude records can omit cwd. In that case only the exact bucket
+    // mapping from ~/.claude.json is allowed; never reconstruct a path from a
+    // sanitized folder name.
+    let Some(mapped_workspace) = project_map.get(bucket_name) else {
+        return Ok(false);
+    };
+    Ok(
+        crate::multi_agent_workspace::normalize_workspace(&project_root_from_cwd(mapped_workspace))
+            .is_ok_and(|candidate| candidate == workspace),
+    )
 }
 
 fn parse_agent_jsonl(
@@ -2990,6 +3691,55 @@ fn find_opencode_sessions(base_dir: std::path::PathBuf, result: &mut Vec<SavedSe
     }
 }
 
+/// Recovery lookup for one known workspace. Unlike the history board's
+/// OpenCode query, this does not take the newest global 30 sessions and then
+/// filter them in the WebView.
+fn find_opencode_sessions_for_workspace(
+    base_dir: std::path::PathBuf,
+    workspace: &str,
+    result: &mut Vec<SavedSession>,
+) {
+    let db_path = base_dir.join("opencode.db");
+    if db_path.is_file() {
+        find_drizzle_sessions_sqlite_for_workspace(
+            &db_path,
+            "opencode",
+            "OpenCode Session",
+            workspace,
+            result,
+        );
+        return;
+    }
+
+    let session_dir = base_dir.join("storage").join("session");
+    let message_dir = base_dir.join("storage").join("message");
+    if !session_dir.is_dir() {
+        return;
+    }
+    if let Ok(projects) = std::fs::read_dir(&session_dir) {
+        for project_entry in projects.flatten() {
+            let project_path = project_entry.path();
+            if !project_path.is_dir() {
+                continue;
+            }
+            if let Ok(sessions) = std::fs::read_dir(&project_path) {
+                for session_entry in sessions.flatten() {
+                    let path = session_entry.path();
+                    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+                    if !path.is_file() || !name.starts_with("ses_") || !name.ends_with(".json") {
+                        continue;
+                    }
+                    if let Some(session) = parse_opencode_session(&path, &message_dir) {
+                        if session_matches_recovery_workspace(&session, "opencode", workspace) {
+                            result.push(session);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Read sessions from a Drizzle-schema SQLite db (`session` + `message`
 /// tables). Shared by OpenCode and its forks — MiMo Code uses the identical
 /// schema, so it passes its own `tool_id` / `default_title` and db path.
@@ -3065,6 +3815,66 @@ fn find_drizzle_sessions_sqlite(
 
     if let Ok(iter) = sessions_iter {
         for session in iter.flatten() {
+            result.push(session);
+        }
+    }
+}
+
+fn find_drizzle_sessions_sqlite_for_workspace(
+    db_path: &std::path::Path,
+    tool_id: &str,
+    default_title: &str,
+    workspace: &str,
+    result: &mut Vec<SavedSession>,
+) {
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(_) => return,
+    };
+    // Scope after the SQL rows are decoded so canonical path handling matches
+    // Claude/Codex recovery and does not depend on OpenCode's raw directory
+    // string. There is deliberately no global recency LIMIT here.
+    let query = "SELECT s.id, s.title, s.directory, s.time_updated, \
+                 COUNT(m.id) as msg_count \
+                 FROM session s \
+                 LEFT JOIN message m ON m.session_id = s.id \
+                 WHERE s.time_archived IS NULL \
+                   AND s.parent_id IS NULL \
+                 GROUP BY s.id \
+                 ORDER BY s.time_updated DESC";
+    let mut stmt = match conn.prepare(query) {
+        Ok(statement) => statement,
+        Err(_) => return,
+    };
+    let rows = match stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let title: String = row
+            .get::<_, Option<String>>(1)
+            .unwrap_or(None)
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| default_title.to_string());
+        let directory: String = row.get::<_, Option<String>>(2).unwrap_or(None).unwrap_or_default();
+        let time_updated: i64 = row.get(3).unwrap_or(0);
+        let msg_count: i64 = row.get(4).unwrap_or(0);
+        Ok(SavedSession {
+            id: format!("{}_native_{}", tool_id, id),
+            name: title,
+            tool: tool_id.to_string(),
+            cwd: directory,
+            session_token: Some(id),
+            saved_at: time_updated.to_string(),
+            file_path: Some(db_path.to_string_lossy().into_owned()),
+            turn_count: Some(std::cmp::max(1, msg_count / 2) as u32),
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+    for session in rows.flatten() {
+        if session_matches_recovery_workspace(&session, tool_id, workspace) {
             result.push(session);
         }
     }
@@ -3447,6 +4257,90 @@ fn load_native_history_blocking() -> Result<Vec<SavedSession>, String> {
 
     result.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
     result.truncate(HISTORY_LIMIT);
+    Ok(result)
+}
+
+const RECOVERY_HISTORY_PICKER_LIMIT: usize = 100;
+
+fn session_matches_recovery_workspace(
+    session: &SavedSession,
+    tool: &str,
+    workspace: &str,
+) -> bool {
+    if session.tool != tool || session.cwd.is_empty() || session.session_token.is_none() {
+        return false;
+    }
+    let candidate_workspace = project_root_from_cwd(&session.cwd);
+    crate::multi_agent_workspace::normalize_workspace(&candidate_workspace)
+        .is_ok_and(|normalized| normalized == workspace)
+}
+
+/// Explicit workspace recovery must inspect the requested source rather than
+/// the history board's global recency window. The caller runs this off the UI
+/// command thread and applies a display cap only *after* matching the exact
+/// canonical workspace.
+fn load_native_history_for_workspace_blocking(
+    tool: &str,
+    workspace: &str,
+    result_limit: Option<usize>,
+) -> Result<Vec<SavedSession>, String> {
+    let workspace = crate::multi_agent_workspace::normalize_workspace(workspace)?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| "Could not determine the user home directory".to_string())?;
+    let mut result = Vec::new();
+
+    match tool {
+        "claude" | "codex" => {
+            let descriptor = crate::tools::find(tool)
+                .ok_or_else(|| format!("Unknown coordinated tool '{tool}'"))?;
+            let shape = descriptor
+                .history_shape
+                .as_ref()
+                .ok_or_else(|| format!("{tool} does not expose native history"))?;
+            let depth = shape
+                .jsonl_depth()
+                .ok_or_else(|| format!("{tool} does not use a JSONL native history layout"))?;
+            let scan_dir = crate::tool_config::history_path_for(
+                descriptor.id,
+                shape.join_under(&home),
+            );
+            let mut candidates = Vec::new();
+            collect_jsonl_paths_with_mtime(scan_dir, depth, descriptor.id, &mut candidates);
+            candidates.sort_by(|left, right| right.0.cmp(&left.0));
+            let claude_project_map = if tool == "claude" {
+                load_claude_project_map(&home)
+            } else {
+                std::collections::HashMap::new()
+            };
+            for (_, path, _) in candidates {
+                let parsed = if tool == "claude" {
+                    parse_agent_jsonl(&path, "claude", &claude_project_map)
+                } else {
+                    parse_codex_session_jsonl(&path)
+                };
+                if let Some(session) = parsed {
+                    if session_matches_recovery_workspace(&session, tool, &workspace) {
+                        result.push(session);
+                    }
+                }
+            }
+        }
+        "opencode" => {
+            if let Some(opencode_dir) = opencode_root(&home) {
+                find_opencode_sessions_for_workspace(opencode_dir, &workspace, &mut result);
+            }
+        }
+        _ => return Err(format!("'{tool}' is not a coordinated multi-agent tool")),
+    }
+
+    for session in &mut result {
+        session.cwd = project_root_from_cwd(&session.cwd);
+    }
+    result.retain(|session| session_matches_recovery_workspace(session, tool, &workspace));
+    result.sort_by(|left, right| right.saved_at.cmp(&left.saved_at));
+    if let Some(limit) = result_limit {
+        result.truncate(limit);
+    }
     Ok(result)
 }
 
@@ -4071,17 +4965,322 @@ pub fn set_tool_config(
     crate::tool_config::set(&tool, entry).map_err(|e| e.to_string())
 }
 
+// ─── Coffee-managed external MCP profiles (~/.coffee-cli/mcp.json) ──────────
+
+#[tauri::command]
+pub fn get_mcp_config() -> Result<crate::mcp_config::McpConfig, String> {
+    crate::mcp_config::load()
+}
+
+#[tauri::command]
+pub fn get_mcp_config_recovery_token() -> Result<String, String> {
+    crate::mcp_config::invalid_config_recovery_token()
+}
+
+#[tauri::command]
+pub fn reset_invalid_mcp_config(
+    expected_token: String,
+    state: State<'_, AppState>,
+) -> Result<crate::mcp_config::McpConfig, String> {
+    let _guard = state
+        .mcp_config_lock
+        .lock()
+        .map_err(|_| "MCP configuration lock was poisoned".to_string())?;
+    crate::mcp_config::reset_invalid_config(&expected_token)
+}
+
+#[tauri::command]
+pub fn get_mcp_multi_agent_binding(
+    workspace: String,
+    pane: u8,
+) -> Result<Option<String>, String> {
+    let config = crate::mcp_config::load()?;
+    crate::mcp_config::multi_agent_binding_profile(&config, &workspace, pane)
+}
+
+#[tauri::command]
+pub fn save_mcp_config(
+    mut config: crate::mcp_config::McpConfig,
+    state: State<'_, AppState>,
+) -> Result<crate::mcp_config::McpConfig, String> {
+    let _guard = state
+        .mcp_config_lock
+        .lock()
+        .map_err(|_| "MCP configuration lock was poisoned".to_string())?;
+    let current = crate::mcp_config::load()?;
+    if config.revision != current.revision {
+        return Err("MCP configuration changed in another Coffee window; reload it before saving".to_string());
+    }
+    crate::mcp_config::bump_revision(&mut config)?;
+    crate::mcp_config::save(config)
+}
+
+#[tauri::command]
+pub fn set_mcp_multi_agent_binding(
+    workspace: String,
+    pane: u8,
+    mutation: crate::mcp_config::McpMultiAgentBindingMutation,
+    state: State<'_, AppState>,
+) -> Result<crate::mcp_config::McpConfig, String> {
+    let _guard = state
+        .mcp_config_lock
+        .lock()
+        .map_err(|_| "MCP configuration lock was poisoned".to_string())?;
+    let mut config = crate::mcp_config::load()?;
+    if !crate::mcp_config::apply_multi_agent_binding_mutation(
+        &mut config,
+        &workspace,
+        pane,
+        mutation,
+    )? {
+        return Ok(config);
+    }
+    crate::mcp_config::bump_revision(&mut config)?;
+    crate::mcp_config::save(config)
+}
+
+// ─── Recoverable multi-agent workspaces ──────────────────────────────────────
+
+/// Register the WebView instance that owns coordinated panes. A Tauri process
+/// can outlive a renderer crash/reload; retire exact old generations before
+/// this command resolves so the replacement renderer cannot restore a second
+/// set of agents for the same snapshot.
+#[tauri::command]
+async fn register_multi_agent_renderer(
+    renderer_instance_id: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let retired_runs = crate::multi_agent_workspace::register_renderer_instance(
+        &state.multi_agent_workspace_lock,
+        &state.multi_agent_workspace_runtime,
+        &state.terminal_session,
+        &state.terminal_launches,
+        &renderer_instance_id,
+    )?;
+    let mut failures = Vec::new();
+    for (session_id, run_id) in retired_runs {
+        if let Err(error) = stop_terminal_generation(
+            &state,
+            &app,
+            &session_id,
+            &run_id,
+            "Coffee renderer was replaced",
+        )
+        .await
+        {
+            failures.push(format!("{session_id}: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Some prior multi-agent panes could not be stopped: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+#[tauri::command]
+fn list_multi_agent_workspaces(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::multi_agent_workspace::WorkspaceSummary>, String> {
+    crate::multi_agent_workspace::list(&state.multi_agent_workspace_lock)
+}
+
+#[tauri::command]
+fn checkpoint_multi_agent_workspace(
+    checkpoint: crate::multi_agent_workspace::WorkspaceCheckpoint,
+    allow_create: bool,
+    renderer_instance_id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::multi_agent_workspace::WorkspaceSummary, String> {
+    crate::multi_agent_workspace::checkpoint(
+        &state.multi_agent_workspace_lock,
+        &state.multi_agent_workspace_runtime,
+        checkpoint,
+        allow_create,
+        &renderer_instance_id,
+    )
+}
+
+#[tauri::command]
+fn discard_multi_agent_workspace(
+    snapshot_id: String,
+    renderer_instance_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::multi_agent_workspace::discard(
+        &state.multi_agent_workspace_lock,
+        &state.multi_agent_workspace_runtime,
+        &snapshot_id,
+        &renderer_instance_id,
+    )
+}
+
+#[tauri::command]
+async fn list_multi_agent_workspace_pane_history(
+    snapshot_id: String,
+    pane_index: u8,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::multi_agent_workspace::WorkspaceHistoryCandidate>, String> {
+    let lock = state.multi_agent_workspace_lock.clone();
+    let runtime = state.multi_agent_workspace_runtime.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::multi_agent_workspace::list_pane_history(&lock, &runtime, &snapshot_id, pane_index)
+    })
+    .await
+    .map_err(|error| format!("Workspace history task join failed: {error}"))?
+}
+
+#[tauri::command]
+async fn bind_multi_agent_workspace_pane(
+    snapshot_id: String,
+    pane_index: u8,
+    selection_id: String,
+    renderer_instance_id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::multi_agent_workspace::WorkspaceSummary, String> {
+    let lock = state.multi_agent_workspace_lock.clone();
+    let runtime = state.multi_agent_workspace_runtime.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::multi_agent_workspace::bind_pane_from_history(
+            &lock,
+            &runtime,
+            &snapshot_id,
+            pane_index,
+            &selection_id,
+            &renderer_instance_id,
+        )
+    })
+    .await
+    .map_err(|error| format!("Workspace history binding task join failed: {error}"))?
+}
+
+#[tauri::command]
+fn set_multi_agent_workspace_pane_continuation(
+    snapshot_id: String,
+    pane_index: u8,
+    choice: crate::multi_agent_workspace::PaneContinuationChoice,
+    renderer_instance_id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::multi_agent_workspace::WorkspaceSummary, String> {
+    crate::multi_agent_workspace::set_pane_continuation(
+        &state.multi_agent_workspace_lock,
+        &state.multi_agent_workspace_runtime,
+        &snapshot_id,
+        pane_index,
+        choice,
+        &renderer_instance_id,
+    )
+}
+
+#[tauri::command]
+async fn preflight_multi_agent_workspace(
+    snapshot_id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::multi_agent_workspace::WorkspaceRestorePlan, String> {
+    let lock = state.multi_agent_workspace_lock.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::multi_agent_workspace::preflight(&lock, &snapshot_id)
+    })
+    .await
+    .map_err(|error| format!("Workspace preflight task join failed: {error}"))?
+}
+
+#[tauri::command]
+async fn begin_multi_agent_workspace_restore(
+    snapshot_id: String,
+    expected_revision: u64,
+    renderer_instance_id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::multi_agent_workspace::BeginRestoreResult, String> {
+    let lock = state.multi_agent_workspace_lock.clone();
+    let runtime = state.multi_agent_workspace_runtime.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::multi_agent_workspace::begin_restore(
+            &lock,
+            &runtime,
+            &snapshot_id,
+            expected_revision,
+            &renderer_instance_id,
+        )
+    })
+    .await
+    .map_err(|error| format!("Workspace restore task join failed: {error}"))?
+}
+
+#[tauri::command]
+fn release_multi_agent_workspace_restore(
+    attempt_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::multi_agent_workspace::release_restore_attempt(
+        &state.multi_agent_workspace_runtime,
+        &attempt_id,
+    )
+}
+
+#[tauri::command]
+fn cancel_multi_agent_workspace_pane_launch(
+    session_id: String,
+    restore_attempt: crate::multi_agent_workspace::RestoreAttemptRef,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::multi_agent_workspace::cancel_restore_pane_launch(
+        &state.multi_agent_workspace_runtime,
+        &session_id,
+        &restore_attempt,
+    )
+}
+
 #[derive(Serialize)]
 pub struct MultiAgentModeReport {
     pub ok: bool,
     pub warnings: Vec<String>,
 }
 
-async fn cleanup_pane_mcp(state: &AppState, pane_id: &str) {
-    if let Some(endpoint) = state.pane_mcp_endpoints.lock().await.remove(pane_id) {
+fn pane_mcp_key(pane_id: &str, run_id: &str) -> String {
+    format!("{pane_id}\0{run_id}")
+}
+
+async fn cleanup_pane_mcp(state: &AppState, pane_id: &str, run_id: &str) {
+    let key = pane_mcp_key(pane_id, run_id);
+    if let Some(endpoint) = state.pane_mcp_endpoints.lock().await.remove(&key) {
         endpoint.shutdown();
     }
-    crate::mcp_injector::remove_pane_artifacts(pane_id);
+    crate::mcp_injector::remove_pane_artifacts(pane_id, run_id);
+}
+
+/// Terminal reader threads own the only reliable natural-exit signal. Run
+/// this cleanup from the backend so an unmounted frontend cannot leak an MCP
+/// listener or temporary config directory. The exact generation key makes a
+/// delayed old exit harmless to a replacement pane.
+pub(crate) fn schedule_terminal_run_cleanup(
+    app: tauri::AppHandle,
+    session_id: String,
+    run_id: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        crate::multi_agent_workspace::release_terminal_run(
+            &state.multi_agent_workspace_lock,
+            &state.multi_agent_workspace_runtime,
+            &session_id,
+            &run_id,
+        );
+        // Task records carry the target run id, so an old natural exit can
+        // fail only its own in-flight task even after a replacement pane has
+        // been installed and dispatched new work.
+        if let Some(event) = state
+            .multi_agent_tasks
+            .fail_target(&session_id, &run_id, "peer pane exited".to_string())
+        {
+            let _ = app.emit("multi-agent-task-complete", event);
+        }
+        cleanup_pane_mcp(&state, &session_id, &run_id).await;
+    });
 }
 
 /// Lazy-spawn a PER-PANE MCP server bound to a specific pane id, on
@@ -4097,12 +5296,14 @@ async fn cleanup_pane_mcp(state: &AppState, pane_id: &str) {
 pub async fn ensure_pane_mcp_running(
     state: &AppState,
     pane_id: &str,
+    run_id: &str,
     app: tauri::AppHandle,
 ) -> Result<crate::mcp_server::McpEndpoint, String> {
+    let key = pane_mcp_key(pane_id, run_id);
     // Fast path — already spawned for this pane.
     {
         let guard = state.pane_mcp_endpoints.lock().await;
-        if let Some(ep) = guard.get(pane_id) {
+        if let Some(ep) = guard.get(&key) {
             return Ok(ep.clone());
         }
     }
@@ -4111,7 +5312,7 @@ pub async fn ensure_pane_mcp_running(
     let _spawn_guard = state.mcp_spawn_lock.lock().await;
     {
         let guard = state.pane_mcp_endpoints.lock().await;
-        if let Some(ep) = guard.get(pane_id) {
+        if let Some(ep) = guard.get(&key) {
             return Ok(ep.clone());
         }
     }
@@ -4123,19 +5324,23 @@ pub async fn ensure_pane_mcp_running(
             app,
         ),
     );
-    let endpoint = crate::mcp_server::spawn(panes, Some(pane_id.to_string()))
+    let endpoint = crate::mcp_server::spawn(
+        panes,
+        Some(pane_id.to_string()),
+        Some(run_id.to_string()),
+    )
         .await
         .map_err(|e| format!("mcp spawn for {}: {}", pane_id, e))?;
     log::info!(
-        "[mcp] per-pane server up at {} (pane={})",
-        endpoint.url, pane_id
+        "[mcp] per-pane server up at {} (pane={}, run={})",
+        endpoint.url, pane_id, run_id
     );
 
     state
         .pane_mcp_endpoints
         .lock()
         .await
-        .insert(pane_id.to_string(), endpoint.clone());
+        .insert(key, endpoint.clone());
     Ok(endpoint)
 }
 
@@ -4240,6 +5445,9 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
             terminal_session,
+            terminal_launches: std::sync::Arc::new(Mutex::new(
+                terminal::TerminalLaunchRegistry::default(),
+            )),
             multi_agent_tasks: std::sync::Arc::new(
                 crate::mcp_server::TaskCoordinator::new(),
             ),
@@ -4249,6 +5457,11 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
                 std::collections::HashMap::new(),
             ),
             mcp_spawn_lock: tokio::sync::Mutex::new(()),
+            mcp_config_lock: Mutex::new(()),
+            multi_agent_workspace_lock: Arc::new(Mutex::new(())),
+            multi_agent_workspace_runtime: Arc::new(Mutex::new(
+                crate::multi_agent_workspace::WorkspaceRuntime::default(),
+            )),
         })
         .invoke_handler(tauri::generate_handler![
             crate::fonts::list_system_fonts,
@@ -4301,6 +5514,23 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
             get_tool_config,
             get_all_tool_configs,
             set_tool_config,
+            get_mcp_config,
+            get_mcp_config_recovery_token,
+            reset_invalid_mcp_config,
+            get_mcp_multi_agent_binding,
+            save_mcp_config,
+            set_mcp_multi_agent_binding,
+            register_multi_agent_renderer,
+            list_multi_agent_workspaces,
+            checkpoint_multi_agent_workspace,
+            discard_multi_agent_workspace,
+            list_multi_agent_workspace_pane_history,
+            bind_multi_agent_workspace_pane,
+            set_multi_agent_workspace_pane_continuation,
+            preflight_multi_agent_workspace,
+            begin_multi_agent_workspace_restore,
+            release_multi_agent_workspace_restore,
+            cancel_multi_agent_workspace_pane_launch,
             crate::git::git_changes,
             crate::git::git_show_file,
             crate::git::git_init,
@@ -4442,10 +5672,32 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
 
             if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
                 let state = app_handle.state::<AppState>();
+                // A restore can have reserved a launch before portable-pty has
+                // inserted it into terminal_session. Cancel those exact
+                // generations first so a delayed spawn cannot outlive the
+                // application exit path.
+                let pending_restore_runs = crate::multi_agent_workspace::cancel_all_for_shutdown(
+                    &state.multi_agent_workspace_lock,
+                    &state.multi_agent_workspace_runtime,
+                    &state.terminal_session,
+                    &state.terminal_launches,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("[multi-agent-workspace] shutdown recovery cleanup failed: {error}");
+                    Vec::new()
+                });
+                if let Ok(mut launches) = state.terminal_launches.lock() {
+                    for (session_id, run_id) in pending_restore_runs {
+                        launches.cancel(&session_id, &run_id);
+                    }
+                }
                 let mut n = 0usize;
                 if let Ok(mut map) = state.terminal_session.lock() {
                     n = map.len();
                     for (_, session) in map.drain() {
+                        session
+                            .run_is_live
+                            .store(false, std::sync::atomic::Ordering::Release);
                         let _ = session.kill_tx.send(());
                     }
                 }
@@ -4644,6 +5896,39 @@ mod resume_cwd_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_arguments_keep_codex_mcp_overrides() {
+        let artifacts = crate::mcp_injector::SessionMcpArtifacts {
+            codex_extra_args: vec![
+                "-c".into(),
+                "mcp_servers.chrome.command=\"npx\"".into(),
+            ],
+            ..Default::default()
+        };
+        let mut args = vec!["resume".into(), "session-123".into()];
+
+        append_session_mcp_args(
+            &mut args,
+            Some("codex"),
+            true,
+            Some(&artifacts),
+            "tab-1::pane-2",
+        );
+
+        assert_eq!(&args[..2], ["resume", "session-123"]);
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".into()));
+        assert_eq!(
+            &args[3..],
+            ["-c", "mcp_servers.chrome.command=\"npx\""]
+        );
+    }
+
+    #[test]
+    fn explicit_frontend_cwd_wins_over_tool_default() {
+        let path = resolve_launch_cwd(Some("codex"), Some("/does/not/exist"));
+        assert_eq!(path, PathBuf::from("/does/not/exist"));
+    }
 
     /// Build a temp Drizzle-schema SQLite db (the `session` + `message` shape
     /// `find_drizzle_sessions_sqlite` reads), seeded with one parent session,

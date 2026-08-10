@@ -4,7 +4,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { AppProvider } from './store/app-state';
 import { App } from './App';
-import { invoke, commands } from './tauri';
+import { invoke, commands, isTauri } from './tauri';
 import { loadToolInfo } from './lib/tool-info';
 import { onWindowBackground, onWindowForeground } from './lib/window-focus-filter';
 import { IS_MACOS, IS_WINDOWS } from './lib/platform';
@@ -20,11 +20,19 @@ if (IS_MACOS) document.documentElement.classList.add('is-macos');
 // gated to this class so Linux keeps its transparent + CSS-clip rounded look).
 if (IS_WINDOWS) document.documentElement.classList.add('is-windows');
 
-// Block React mount on the registry IPC so every component reads
-// canonical display names on first render (no 'claude' → 'Claude
-// Code' label flash). The window is `visible: false` until
-// show_main_window fires below, so the ~10ms wait is invisible.
-void loadToolInfo().finally(() => {
+// Block React mount on the registry IPC and on renderer ownership
+// registration. The latter retires any coordinated panes left behind by a
+// WebView crash/reload before a fresh component tree can checkpoint or restore
+// the same workspace. The native window remains hidden during this short wait.
+void Promise.allSettled([
+  loadToolInfo(),
+  ...(isTauri ? [commands.registerMultiAgentRenderer()] : []),
+]).then((results) => {
+  const rendererRegistration = results[1];
+  if (rendererRegistration?.status === 'rejected') {
+    console.error('[multi-agent] renderer registration failed:', rendererRegistration.reason);
+  }
+}).finally(() => {
   ReactDOM.createRoot(document.getElementById('root')!).render(
     <React.StrictMode>
       <AppProvider>

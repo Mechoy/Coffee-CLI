@@ -2,6 +2,7 @@
 
 import { createContext, useContext, useReducer } from 'react';
 import type { ReactNode } from 'react';
+import type { McpProfileSelection } from '../tauri';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -125,6 +126,32 @@ export interface MultiAgentPane {
   // event, completionTs drives the pane badge's temporary green dot.
   sentinelEnabled?: boolean;
   completionTs?: number;
+  mcpSelection?: McpProfileSelection;
+  /**
+   * Explicit restore intent. `undefined` means preserve a backend-verified
+   * native identity when one exists; fresh/skipped are deliberate user choices.
+   */
+  workspaceContinuation?: 'fresh_by_user' | 'skipped';
+  /**
+   * A skipped recovered pane is visually empty, but the checkpoint must retain
+   * its original tool so the backend can verify the immutable layout.
+   */
+  restoreTool?: Exclude<ToolType, null>;
+  /**
+   * A recoverable pane that cannot be started yet stays visible as a distinct
+   * state. It must not silently turn into an ordinary empty picker and lose
+   * the reason the user needs to address.
+   */
+  restoreStatus?: 'needs_binding' | 'cwd_missing' | 'tool_missing' | 'mcp_unavailable' | 'token_invalid' | 'launch_failed';
+  restoreReason?: string;
+  /**
+   * A backend restore lease is single-use per pane. This flag is cleared only
+   * after that pane's initial launch is accepted, or after the user changes
+   * the pane intentionally.
+   */
+  restoreLeasePending?: boolean;
+  /** A pane the user explicitly closed must start a new native session next. */
+  startFreshOnSelect?: boolean;
 }
 
 /// State attached to a Tab with `tool === 'multi-agent'`. All four panes
@@ -155,12 +182,21 @@ export interface TerminalSession {
   /// which spawns the tool with its `--resume <token>` flag instead of a
   /// fresh launch. Cleared on any subsequent SET_TERMINAL_TOOL.
   resumeToken?: string;
+  mcpSelection?: McpProfileSelection;
   isHidden?: boolean;
   agentStatus?: AgentStatus;
   gambitDraft?: string;    // Unsent textarea content, preserved across tab switches
   /// When present, this Tab renders as a 2×2+ pane grid instead of a
   /// single terminal. See docs/MULTI-AGENT-ARCHITECTURE.md §5.7 and §7.
   multiAgent?: MultiAgentState;
+  /** Backend-owned recovery record for a coordinated 2/3/4-pane tab. */
+  multiAgentWorkspaceId?: string;
+  /** Monotonic topology version used to reject stale checkpoint writes. */
+  multiAgentWorkspaceCheckpointVersion?: number;
+  /** Process-local restore lease. It never contains a native session token. */
+  multiAgentRestoreAttemptId?: string;
+  /** True only after this renderer has confirmed the compact snapshot exists. */
+  multiAgentWorkspacePersisted?: boolean;
 }
 
 // ─── State Shape ─────────────────────────────────────────────────────────────
@@ -277,6 +313,44 @@ const MULTI_AGENT_TOOLS: ReadonlySet<ToolType> = new Set<ToolType>(['multi-agent
 export const isSplitTool = (t: ToolType): boolean => SPLIT_TOOLS.has(t);
 export const isMultiAgentTool = (t: ToolType): boolean => MULTI_AGENT_TOOLS.has(t);
 
+/**
+ * A coordinated workspace snapshot belongs to one canonical project folder.
+ * Moving an active multi-agent tab to another folder must fork a fresh record,
+ * never overwrite the old project's recoverable conversations. Active panes
+ * restart as explicit fresh conversations in the new project.
+ */
+function forkMultiAgentWorkspaceForFolderChange(
+  session: TerminalSession,
+  clearPaneTools = false,
+): Partial<TerminalSession> {
+  const panes = session.multiAgent?.panes.map((pane) => {
+    const tool = clearPaneTools ? null : pane.tool;
+    return {
+      ...pane,
+      tool,
+      agentStatus: undefined,
+      completionTs: undefined,
+      mcpSelection: { mode: 'auto' as const },
+      restoreTool: undefined,
+      restoreStatus: undefined,
+      restoreReason: undefined,
+      restoreLeasePending: false,
+      workspaceContinuation: tool ? 'fresh_by_user' as const : undefined,
+      startFreshOnSelect: false,
+    };
+  });
+  return {
+    ...(session.multiAgent ? { multiAgent: { ...session.multiAgent, focusedPaneIdx: null, panes: panes ?? [] } } : {}),
+    multiAgentWorkspaceId: crypto.randomUUID(),
+    multiAgentWorkspaceCheckpointVersion: 0,
+    multiAgentRestoreAttemptId: undefined,
+    multiAgentWorkspacePersisted: false,
+    restartKey: (session.restartKey ?? 0) + 1,
+    toolTitle: undefined,
+    agentStatus: undefined,
+  };
+}
+
 // `kind` is a backend protocol contract: `::pane-N` triggers hands-free flag
 // injection (yolo / skip-permissions) for coordinated multi-agent; `::split-N`
 // leaves them off so each pane prompts as a normal interactive PTY.
@@ -322,7 +396,7 @@ type Action =
   | { type: 'REMOVE_TERMINAL'; id: string }
   | { type: 'REORDER_TERMINAL'; sessionId: string; beforeId: string | null }
   | { type: 'SET_ACTIVE_TERMINAL'; id: string | null }
-  | { type: 'SET_TERMINAL_TOOL'; id: string; tool: ToolType; toolData?: string; resumeToken?: string }
+  | { type: 'SET_TERMINAL_TOOL'; id: string; tool: ToolType; toolData?: string; resumeToken?: string; mcpSelection?: McpProfileSelection }
   | { type: 'SET_TERMINAL_HIDDEN'; id: string; isHidden: boolean }
   | { type: 'RESTART_TERMINAL'; id: string; newId: string }
   | { type: 'OPEN_HYPER_AGENT_TAB' }
@@ -340,8 +414,11 @@ type Action =
   | { type: 'SET_HOTKEY_SCHEME'; value: HotkeyScheme }
   | { type: 'SET_TITLEBAR_TOGGLE_DISPLAY'; value: TitlebarToggleDisplay }
   | { type: 'SET_GAMBIT_DRAFT'; id: string; draft: string }
-  | { type: 'SET_PANE_TOOL'; tabId: string; paneIdx: number; tool: ToolType; toolData?: string; folderPath?: string | null }
+  | { type: 'SET_PANE_TOOL'; tabId: string; paneIdx: number; tool: ToolType; toolData?: string; folderPath?: string | null; mcpSelection?: McpProfileSelection }
+  | { type: 'SET_PANE_MCP_SELECTION'; tabId: string; paneIdx: number; selection: McpProfileSelection }
   | { type: 'SET_PANE_SENTINEL'; tabId: string; paneIdx: number; enabled: boolean }
+  | { type: 'ACK_PANE_WORKSPACE_LAUNCH'; tabId: string; paneIdx: number; accepted: boolean; restoreAttemptId?: string }
+  | { type: 'MARK_MULTI_AGENT_WORKSPACE_PERSISTED'; tabId: string }
   | { type: 'SET_PANE_COMPLETION'; tabId: string; paneIdx: number; ts: number }
   | { type: 'SET_FOCUSED_PANE'; tabId: string; paneIdx: number | null }
   | { type: 'TOGGLE_LEFT_PANEL' }
@@ -364,13 +441,37 @@ function reducer(state: AppState, action: Action): AppState {
       try { localStorage.setItem('cc-folder', action.path); } catch {}
       return {
         ...state,
-        terminals: state.terminals.map(t => t.id === state.activeTerminalId ? { ...t, folderPath: action.path } : t)
+        terminals: state.terminals.map(t => {
+          if (t.id !== state.activeTerminalId) return t;
+          const workspaceChanged = isMultiAgentTool(t.tool) && t.folderPath !== action.path;
+          return {
+            ...t,
+            folderPath: action.path,
+            ...(workspaceChanged
+              ? forkMultiAgentWorkspaceForFolderChange(t)
+              : isMultiAgentTool(t.tool) && t.multiAgentWorkspaceId
+                ? { multiAgentWorkspaceCheckpointVersion: (t.multiAgentWorkspaceCheckpointVersion ?? 0) + 1 }
+                : {}),
+          };
+        })
       };
     case 'CLEAR_FOLDER':
       try { localStorage.removeItem('cc-folder'); } catch {}
       return {
         ...state,
-        terminals: state.terminals.map(t => t.id === state.activeTerminalId ? { ...t, folderPath: null } : t)
+        terminals: state.terminals.map(t => {
+          if (t.id !== state.activeTerminalId) return t;
+          const workspaceChanged = isMultiAgentTool(t.tool) && t.folderPath !== null;
+          return {
+            ...t,
+            folderPath: null,
+            ...(workspaceChanged
+              ? forkMultiAgentWorkspaceForFolderChange(t, true)
+              : isMultiAgentTool(t.tool) && t.multiAgentWorkspaceId
+                ? { multiAgentWorkspaceCheckpointVersion: (t.multiAgentWorkspaceCheckpointVersion ?? 0) + 1 }
+                : {}),
+          };
+        })
       };
     case 'SET_TAB_TITLE':
       // OSC 0/2 title from the tool (xterm onTitleChange). Skip if the session
@@ -437,7 +538,20 @@ function reducer(state: AppState, action: Action): AppState {
     case 'SET_TERMINAL_TOOL':
       return {
         ...state,
-        terminals: state.terminals.map(t => t.id === action.id ? { ...t, tool: action.tool, toolData: action.toolData, resumeToken: action.resumeToken, toolTitle: undefined, agentStatus: undefined } : t)
+        terminals: state.terminals.map(t => t.id === action.id ? {
+          ...t,
+          tool: action.tool,
+          toolData: action.toolData,
+          resumeToken: action.resumeToken,
+          mcpSelection: action.mcpSelection ?? { mode: 'auto' },
+          toolTitle: undefined,
+          agentStatus: undefined,
+          ...(isMultiAgentTool(action.tool) ? {
+            multiAgentWorkspaceId: t.multiAgentWorkspaceId ?? crypto.randomUUID(),
+            multiAgentWorkspaceCheckpointVersion: t.multiAgentWorkspaceCheckpointVersion ?? 0,
+            multiAgentWorkspacePersisted: t.multiAgentWorkspacePersisted ?? false,
+          } : {}),
+        } : t)
       };
     case 'SET_TERMINAL_HIDDEN':
       return {
@@ -523,23 +637,57 @@ function reducer(state: AppState, action: Action): AppState {
           if (t.id !== action.tabId) return t;
           const existing = t.multiAgent?.panes
             ?? ([1, 2, 3, 4].map(i => ({ paneIdx: i, tool: null as ToolType })) as MultiAgentPane[]);
+          const panes = existing.map(p => {
+            if (p.paneIdx !== action.paneIdx) return p;
+            const wasSkipped = p.workspaceContinuation === 'skipped' && p.restoreTool !== undefined;
+            const startsFresh = p.startFreshOnSelect === true || wasSkipped;
+            return {
+              ...p,
+              tool: action.tool,
+              toolData: action.toolData,
+              // Only overwrite folderPath when the action explicitly carries
+              // one. Clearing a pane also records a fresh-start boundary so a
+              // later re-selection cannot accidentally revive its old chat.
+              folderPath: action.folderPath !== undefined
+                ? action.folderPath
+                : (action.tool === null ? null : p.folderPath),
+              mcpSelection: action.mcpSelection
+                ?? (action.tool === null ? { mode: 'auto' as const } : p.mcpSelection),
+              restoreTool: undefined,
+              restoreStatus: undefined,
+              restoreReason: undefined,
+              restoreLeasePending: false,
+              workspaceContinuation: action.tool === null
+                ? undefined
+                : (startsFresh ? 'fresh_by_user' : p.workspaceContinuation),
+              startFreshOnSelect: action.tool === null,
+            };
+          });
+          const checkpoint = isMultiAgentTool(t.tool) ? {
+            multiAgentWorkspaceId: t.multiAgentWorkspaceId ?? crypto.randomUUID(),
+            multiAgentWorkspaceCheckpointVersion: (t.multiAgentWorkspaceCheckpointVersion ?? 0) + 1,
+            multiAgentWorkspacePersisted: t.multiAgentWorkspacePersisted ?? false,
+          } : {};
+          return { ...t, multiAgent: { ...t.multiAgent, panes }, ...checkpoint };
+        }),
+      };
+    }
+    case 'SET_PANE_MCP_SELECTION': {
+      return {
+        ...state,
+        terminals: state.terminals.map(t => {
+          if (t.id !== action.tabId) return t;
+          const existing = t.multiAgent?.panes
+            ?? ([1, 2, 3, 4].map(i => ({ paneIdx: i, tool: null as ToolType })) as MultiAgentPane[]);
           const panes = existing.map(p =>
-            p.paneIdx === action.paneIdx
-              ? {
-                  ...p,
-                  tool: action.tool,
-                  toolData: action.toolData,
-                  // Only overwrite folderPath when the action explicitly
-                  // carries one. Clearing a pane (tool=null without folderPath)
-                  // wipes the pane back to empty state, so we also null out
-                  // the stored folder to avoid ghost state.
-                  folderPath: action.folderPath !== undefined
-                    ? action.folderPath
-                    : (action.tool === null ? null : p.folderPath),
-                }
-              : p
+            p.paneIdx === action.paneIdx ? { ...p, mcpSelection: action.selection } : p
           );
-          return { ...t, multiAgent: { ...t.multiAgent, panes } };
+          const checkpoint = isMultiAgentTool(t.tool) ? {
+            multiAgentWorkspaceId: t.multiAgentWorkspaceId ?? crypto.randomUUID(),
+            multiAgentWorkspaceCheckpointVersion: (t.multiAgentWorkspaceCheckpointVersion ?? 0) + 1,
+            multiAgentWorkspacePersisted: t.multiAgentWorkspacePersisted ?? false,
+          } : {};
+          return { ...t, multiAgent: { ...t.multiAgent, panes }, ...checkpoint };
         }),
       };
     }
@@ -553,10 +701,62 @@ function reducer(state: AppState, action: Action): AppState {
           const panes = existing.map(p =>
             p.paneIdx === action.paneIdx ? { ...p, sentinelEnabled: action.enabled } : p
           );
-          return { ...t, multiAgent: { ...t.multiAgent, panes } };
+          const checkpoint = isMultiAgentTool(t.tool) ? {
+            multiAgentWorkspaceId: t.multiAgentWorkspaceId ?? crypto.randomUUID(),
+            multiAgentWorkspaceCheckpointVersion: (t.multiAgentWorkspaceCheckpointVersion ?? 0) + 1,
+            multiAgentWorkspacePersisted: t.multiAgentWorkspacePersisted ?? false,
+          } : {};
+          return { ...t, multiAgent: { ...t.multiAgent, panes }, ...checkpoint };
         }),
       };
     }
+    case 'ACK_PANE_WORKSPACE_LAUNCH': {
+      return {
+        ...state,
+        terminals: state.terminals.map(t => {
+          if (t.id !== action.tabId || !t.multiAgent) return t;
+          // A delayed callback from an abandoned restore must never settle a
+          // newer restore attempt that happens to use the same tab and pane.
+          if (action.restoreAttemptId && t.multiAgentRestoreAttemptId !== action.restoreAttemptId) return t;
+          const panes = t.multiAgent.panes.map(p => {
+            if (p.paneIdx !== action.paneIdx) return p;
+            if (!action.accepted && p.restoreLeasePending && p.tool) {
+              return {
+                ...p,
+                tool: null,
+                restoreTool: p.tool,
+                restoreStatus: 'launch_failed' as const,
+                restoreReason: 'The restored pane did not start. Recheck the workspace and retry it, or explicitly start a new conversation.',
+                restoreLeasePending: false,
+                workspaceContinuation: undefined,
+                startFreshOnSelect: true,
+              };
+            }
+            return {
+              ...p,
+              restoreLeasePending: false,
+              ...(action.accepted && p.workspaceContinuation === 'fresh_by_user'
+                ? { workspaceContinuation: undefined, startFreshOnSelect: false }
+                : {}),
+            };
+          });
+          return {
+            ...t,
+            multiAgent: { ...t.multiAgent, panes },
+            ...(action.accepted ? { multiAgentWorkspacePersisted: true } : {}),
+          };
+        }),
+      };
+    }
+    case 'MARK_MULTI_AGENT_WORKSPACE_PERSISTED':
+      return {
+        ...state,
+        terminals: state.terminals.map(t =>
+          t.id === action.tabId && isMultiAgentTool(t.tool) && !t.multiAgentWorkspacePersisted
+            ? { ...t, multiAgentWorkspacePersisted: true }
+            : t
+        ),
+      };
     case 'SET_PANE_COMPLETION': {
       return {
         ...state,

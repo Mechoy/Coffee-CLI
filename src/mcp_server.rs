@@ -29,7 +29,10 @@
 use std::{
     collections::HashMap,
     io::Write,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::Ordering,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -72,7 +75,15 @@ pub enum PaneTaskStatus {
 struct PaneTaskRecord {
     job_id: String,
     source_id: String,
+    /// Launch generation of the dispatcher. Completion notifications must
+    /// return only to this exact terminal run, never to a later replacement
+    /// using the same logical pane id.
+    source_run_id: String,
     target_id: String,
+    /// Launch generation observed for the target immediately before this job
+    /// was dispatched. A delayed endpoint from an old target generation must
+    /// not be able to complete, fail, or otherwise affect a replacement.
+    target_run_id: String,
     status: PaneTaskStatus,
     summary: Option<String>,
     result_path: Option<String>,
@@ -83,8 +94,12 @@ struct PaneTaskRecord {
 #[derive(Clone, Debug, Serialize)]
 pub struct PaneTaskEvent {
     pub job_id: String,
+    /// The worker that produced the event.
     pub source_id: String,
+    pub source_run_id: String,
+    /// The original dispatcher that must receive the wake-up event.
     pub target_id: String,
+    pub target_run_id: String,
     pub status: PaneTaskStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -94,7 +109,9 @@ pub struct PaneTaskEvent {
 struct TaskCoordinatorState {
     records: HashMap<String, PaneTaskRecord>,
     current_by_target: HashMap<String, String>,
-    latest_by_route: HashMap<(String, String), String>,
+    // Source run is part of the route. Reusing a logical pane id after a
+    // restart must not make its new agent inherit old task results.
+    latest_by_route: HashMap<(String, String, String), String>,
 }
 
 #[derive(Default)]
@@ -107,7 +124,13 @@ impl TaskCoordinator {
         Self::default()
     }
 
-    fn start(&self, source_id: &str, target_id: &str) -> Result<String, String> {
+    fn start(
+        &self,
+        source_id: &str,
+        source_run_id: &str,
+        target_id: &str,
+        target_run_id: &str,
+    ) -> Result<String, String> {
         let mut state = self
             .state
             .lock()
@@ -129,7 +152,9 @@ impl TaskCoordinator {
         let record = PaneTaskRecord {
             job_id: job_id.clone(),
             source_id: source_id.to_string(),
+            source_run_id: source_run_id.to_string(),
             target_id: target_id.to_string(),
+            target_run_id: target_run_id.to_string(),
             status: PaneTaskStatus::Running,
             summary: None,
             result_path: None,
@@ -158,6 +183,7 @@ impl TaskCoordinator {
     fn complete(
         &self,
         target_id: &str,
+        target_run_id: &str,
         job_id: &str,
         summary: String,
         result_path: Option<String>,
@@ -170,13 +196,16 @@ impl TaskCoordinator {
         if current != Some(job_id) {
             return Err("job is stale or does not belong to this pane".to_string());
         }
-        let (source_id, target_id_owned, record_clone) = {
+        let (source_id, source_run_id, target_id_owned, record_clone) = {
             let record = state
                 .records
                 .get_mut(job_id)
                 .ok_or_else(|| "job not found".to_string())?;
             if record.target_id != target_id {
                 return Err("job target identity mismatch".to_string());
+            }
+            if record.target_run_id != target_run_id {
+                return Err("job belongs to a previous target pane run".to_string());
             }
             if record.status == PaneTaskStatus::Completed {
                 return Ok((record.clone(), false));
@@ -189,62 +218,92 @@ impl TaskCoordinator {
             record.result_path = result_path;
             (
                 record.source_id.clone(),
+                record.source_run_id.clone(),
                 record.target_id.clone(),
                 record.clone(),
             )
         };
         state.latest_by_route.insert(
-            (source_id, target_id_owned),
+            (source_id, source_run_id, target_id_owned),
             job_id.to_string(),
         );
         Ok((record_clone, true))
     }
 
-    pub fn fail_target(&self, target_id: &str, error: String) -> Option<PaneTaskEvent> {
+    pub fn fail_target(
+        &self,
+        target_id: &str,
+        target_run_id: &str,
+        error: String,
+    ) -> Option<PaneTaskEvent> {
         let mut state = self.state.lock().ok()?;
         let job_id = state.current_by_target.get(target_id)?.clone();
-        let (source_id, target_id_owned) = {
+        let (source_id, source_run_id, target_id_owned, target_run_id_owned) = {
             let record = state.records.get_mut(&job_id)?;
-            if record.status != PaneTaskStatus::Running {
+            if record.status != PaneTaskStatus::Running || record.target_run_id != target_run_id {
                 return None;
             }
             record.status = PaneTaskStatus::Failed;
             record.error = Some(error.clone());
-            (record.source_id.clone(), record.target_id.clone())
+            (
+                record.source_id.clone(),
+                record.source_run_id.clone(),
+                record.target_id.clone(),
+                record.target_run_id.clone(),
+            )
         };
         state.current_by_target.remove(target_id);
         state.latest_by_route.insert(
-            (source_id.clone(), target_id_owned.clone()),
+            (
+                source_id.clone(),
+                source_run_id.clone(),
+                target_id_owned.clone(),
+            ),
             job_id.clone(),
         );
         Some(PaneTaskEvent {
             job_id,
             source_id: target_id_owned,
+            source_run_id: target_run_id_owned,
             target_id: source_id,
+            target_run_id: source_run_id,
             status: PaneTaskStatus::Failed,
             error: Some(error),
         })
     }
 
-    fn running_for_target(&self, target_id: &str) -> Option<PaneTaskRecord> {
+    fn running_for_target(&self, target_id: &str, target_run_id: &str) -> Option<PaneTaskRecord> {
         let state = self.state.lock().ok()?;
         let job_id = state.current_by_target.get(target_id)?;
         let record = state.records.get(job_id)?;
-        (record.status == PaneTaskStatus::Running).then(|| record.clone())
+        (record.status == PaneTaskStatus::Running && record.target_run_id == target_run_id)
+            .then(|| record.clone())
     }
 
-    fn latest_for_route(&self, source_id: &str, target_id: &str) -> Option<PaneTaskRecord> {
+    fn latest_for_route(
+        &self,
+        source_id: &str,
+        source_run_id: &str,
+        target_id: &str,
+    ) -> Option<PaneTaskRecord> {
         let state = self.state.lock().ok()?;
         if let Some(current_id) = state.current_by_target.get(target_id) {
             if let Some(record) = state.records.get(current_id) {
-                if record.source_id == source_id && record.status == PaneTaskStatus::Running {
+                if record.source_id == source_id
+                    && record.source_run_id == source_run_id
+                    && record.status == PaneTaskStatus::Running
+                {
                     return Some(record.clone());
                 }
             }
         }
         let job_id = state
             .latest_by_route
-            .get(&(source_id.to_string(), target_id.to_string()))?;
+            .get(&(
+                source_id.to_string(),
+                source_run_id.to_string(),
+                target_id.to_string(),
+            ))?;
         state.records.get(job_id).cloned()
     }
 }
@@ -334,6 +393,119 @@ pub struct PaneStore {
     ansi_re: regex::Regex,
 }
 
+/// Resolve a terminal session only when it is still the launch generation
+/// that the caller observed. Logical pane ids are intentionally stable across
+/// restarts, so an id-only lookup would let an old MCP endpoint write to or
+/// complete work for its replacement.
+fn session_for_run<'a>(
+    sessions: &'a std::collections::HashMap<String, crate::terminal::TerminalSession>,
+    id: &str,
+    expected_run_id: &str,
+) -> Result<&'a crate::terminal::TerminalSession, String> {
+    let session = sessions
+        .get(id)
+        .ok_or_else(|| format!("pane not found: {id}"))?;
+    if session.run_id != expected_run_id {
+        return Err(format!("pane {id} was restarted before this operation completed"));
+    }
+    if !session.run_is_live.load(Ordering::Acquire) {
+        return Err(format!("pane {id} is no longer accepting operations"));
+    }
+    Ok(session)
+}
+
+/// Write generated task input only while the source and target generations
+/// remain live. The per-generation lifecycle gates close the final race
+/// between task reservation and PTY I/O without holding the global session
+/// map during a potentially back-pressured write.
+fn write_current_dispatch_input(
+    session: &SharedSession,
+    source_id: &str,
+    source_run_id: &str,
+    target_id: &str,
+    target_run_id: &str,
+    data: &[u8],
+    clear_output: bool,
+    mark_working: bool,
+) -> Result<(), String> {
+    if source_id == target_id {
+        return Err("cannot dispatch to the source pane".to_string());
+    }
+
+    let (
+        source_lifecycle_lock,
+        source_is_live,
+        target_lifecycle_lock,
+        target_is_live,
+        writer_lock,
+        output_buffer,
+        activity,
+    ) = {
+        let guard = session
+            .lock()
+            .map_err(|_| "session map poisoned".to_string())?;
+        let source = session_for_run(&guard, source_id, source_run_id)?;
+        let target = session_for_run(&guard, target_id, target_run_id)?;
+        (
+            source.run_lifecycle_lock.clone(),
+            source.run_is_live.clone(),
+            target.run_lifecycle_lock.clone(),
+            target.run_is_live.clone(),
+            target.writer_lock.clone(),
+            target.output_buffer.clone(),
+            target.activity.clone(),
+        )
+    };
+
+    // Dispatches can cross in both directions, so acquire the pair in a
+    // deterministic order. Retirement holds the session map then one gate;
+    // this path never reacquires the map after it holds either gate.
+    let (first_gate, second_gate) = if source_id < target_id {
+        (source_lifecycle_lock, target_lifecycle_lock)
+    } else {
+        (target_lifecycle_lock, source_lifecycle_lock)
+    };
+    let _first_gate = first_gate
+        .lock()
+        .map_err(|_| "pane lifecycle gate poisoned".to_string())?;
+    let _second_gate = second_gate
+        .lock()
+        .map_err(|_| "pane lifecycle gate poisoned".to_string())?;
+
+    if !source_is_live.load(Ordering::Acquire) {
+        return Err(format!("source pane {source_id} was replaced before dispatch"));
+    }
+    if !target_is_live.load(Ordering::Acquire) {
+        return Err(format!("target pane {target_id} was replaced before dispatch"));
+    }
+
+    if clear_output {
+        let mut ring = output_buffer
+            .lock()
+            .map_err(|_| "output buffer poisoned".to_string())?;
+        ring.clear();
+    }
+
+    if !data.is_empty() {
+        let mut writer = writer_lock
+            .lock()
+            .map_err(|_| "pane writer poisoned".to_string())?;
+        writer
+            .write_all(data)
+            .map_err(|error| format!("pty write failed: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("pty flush failed: {error}"))?;
+    }
+
+    if mark_working {
+        if let Ok(mut current_activity) = activity.lock() {
+            current_activity.mark_working();
+        }
+    }
+    Ok(())
+}
+
 impl PaneStore {
     pub fn new(session: SharedSession, tasks: Arc<TaskCoordinator>, app: AppHandle) -> Self {
         Self {
@@ -347,6 +519,95 @@ impl PaneStore {
         }
     }
 
+    /// Verify that an identity-bound MCP endpoint still belongs to the live
+    /// terminal generation for its logical pane id.
+    async fn ensure_current_run(&self, id: &str, run_id: &str) -> Result<(), String> {
+        let id = id.to_string();
+        let run_id = run_id.to_string();
+        let session = self.session.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let guard = session
+                .lock()
+                .map_err(|_| "session map poisoned".to_string())?;
+            session_for_run(&guard, &id, &run_id).map(|_| ())
+        })
+        .await
+        .map_err(|error| format!("run check failed: {error}"))?
+    }
+
+    /// Reserve a coordinated task only while both participating pane
+    /// generations are still installed.
+    ///
+    /// `send_to_pane` has to await a target readiness check before it can
+    /// reserve the task. A standalone source-run check before that await is
+    /// insufficient: the source can be restarted during the gap. Holding the
+    /// session map while verifying both runs and recording the task gives the
+    /// operation a single linearization point with terminal replacement.
+    async fn start_task_for_current_runs(
+        &self,
+        source_id: &str,
+        source_run_id: &str,
+        target_id: &str,
+        target_run_id: &str,
+    ) -> Result<String, String> {
+        let source_id = source_id.to_string();
+        let source_run_id = source_run_id.to_string();
+        let target_id = target_id.to_string();
+        let target_run_id = target_run_id.to_string();
+        let session = self.session.clone();
+        let tasks = self.tasks.clone();
+        tokio::task::spawn_blocking(move || -> Result<String, String> {
+            // Keep this order aligned with complete_task_for_current_run:
+            // session map, then task coordinator. Terminal replacement only
+            // holds the session map, so it cannot interleave between the
+            // generation check and task reservation.
+            let guard = session
+                .lock()
+                .map_err(|_| "session map poisoned".to_string())?;
+            session_for_run(&guard, &source_id, &source_run_id)
+                .map_err(|error| format!("dispatching pane is no longer current: {error}"))?;
+            session_for_run(&guard, &target_id, &target_run_id)
+                .map_err(|error| format!("target pane is no longer current: {error}"))?;
+            tasks.start(&source_id, &source_run_id, &target_id, &target_run_id)
+        })
+        .await
+        .map_err(|error| format!("task reservation transition failed: {error}"))?
+    }
+
+    /// Complete a task only while the worker's generation remains installed.
+    ///
+    /// The terminal replacement path installs a new run while holding the
+    /// same session-map mutex. Keeping the current-run check and task state
+    /// transition in this one critical section means an old endpoint can
+    /// complete before the replacement is installed or be rejected after it,
+    /// but cannot pass a stale check and complete in between.
+    async fn complete_task_for_current_run(
+        &self,
+        id: &str,
+        run_id: &str,
+        job_id: &str,
+        summary: String,
+        result_path: Option<String>,
+    ) -> Result<(PaneTaskRecord, bool), String> {
+        let id = id.to_string();
+        let run_id = run_id.to_string();
+        let job_id = job_id.to_string();
+        let session = self.session.clone();
+        let tasks = self.tasks.clone();
+        tokio::task::spawn_blocking(move || -> Result<(PaneTaskRecord, bool), String> {
+            // Lock order is session map then task coordinator. No task path
+            // holds the coordinator lock while awaiting this map, so this is
+            // compatible with terminal::spawn's replacement critical section.
+            let guard = session
+                .lock()
+                .map_err(|_| "session map poisoned".to_string())?;
+            session_for_run(&guard, &id, &run_id)?;
+            tasks.complete(&id, &run_id, &job_id, summary, result_path)
+        })
+        .await
+        .map_err(|error| format!("completion transition failed: {error}"))?
+    }
+
     /// Snapshot every session in the shared map as a PaneInfo row.
     ///
     /// This internal snapshot returns every session in the process. The MCP
@@ -357,7 +618,7 @@ impl PaneStore {
             let session = self.session.clone();
             move || {
                 let guard = session.lock().ok()?;
-                let rows: Vec<(String, Option<String>, String, Instant)> = guard
+                let rows: Vec<(String, String, Option<String>, String, Instant)> = guard
                     .iter()
                     .map(|(id, sess)| {
                         let (status, last_at) = match sess.activity.lock() {
@@ -374,7 +635,13 @@ impl PaneStore {
                             }
                             Err(_) => ("unknown".to_string(), Instant::now()),
                         };
-                        (id.clone(), sess.tool_name.clone(), status, last_at)
+                        (
+                            id.clone(),
+                            sess.run_id.clone(),
+                            sess.tool_name.clone(),
+                            status,
+                            last_at,
+                        )
                     })
                     .collect();
                 Some(rows)
@@ -389,11 +656,11 @@ impl PaneStore {
 
         let mut list: Vec<PaneInfo> = raw
             .into_iter()
-            .map(|(id, tool_name, status, last_at)| {
+            .map(|(id, run_id, tool_name, status, last_at)| {
                 let elapsed = now_instant.saturating_duration_since(last_at).as_secs();
                 let last_activity_at = now_epoch.saturating_sub(elapsed);
                 let pane_label = pane_short(&id);
-                let task_running = self.tasks.running_for_target(&id).is_some();
+                let task_running = self.tasks.running_for_target(&id, &run_id).is_some();
                 PaneInfo {
                     title: pane_label.clone(),
                     cli: tool_name.unwrap_or_else(|| "shell".to_string()),
@@ -429,7 +696,10 @@ impl PaneStore {
     /// CLI's own session history are independent and remain untouched.
     async fn dispatch(
         &self,
+        source_id: &str,
+        source_run_id: &str,
         id: &str,
+        expected_run_id: &str,
         text: &str,
         submit: bool,
         wait: bool,
@@ -446,47 +716,31 @@ impl PaneStore {
         let body = text.trim_end_matches(['\r', '\n']).to_string();
         let should_submit = submit;
         let bytes_written = body.len() + if should_submit { 1 } else { 0 };
+        let source_id = source_id.to_string();
+        let source_run_id = source_run_id.to_string();
+        let expected_run_id = expected_run_id.to_string();
 
         // Phase 1a: start a task-scoped capture + write BODY (no Enter yet).
         // read_pane is a result handoff, so retaining older peer tasks only
         // creates ambiguity and makes truncation metadata stale.
         {
+            let source_id2 = source_id.clone();
+            let source_run_id2 = source_run_id.clone();
             let id2 = id.to_string();
+            let run_id2 = expected_run_id.clone();
             let body2 = body.clone();
             let session = self.session.clone();
             tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let (writer_arc, buffer_arc) = {
-                    let guard = session
-                        .lock()
-                        .map_err(|_| "session map poisoned".to_string())?;
-                    let sess = guard
-                        .get(&id2)
-                        .ok_or_else(|| format!("pane not found: {}", id2))?;
-                    (sess.writer_lock.clone(), sess.output_buffer.clone())
-                };
-
-                {
-                    let mut ring = buffer_arc
-                        .lock()
-                        .map_err(|_| "output buffer poisoned".to_string())?;
-                    ring.clear();
-                }
-
-                {
-                    let mut writer = writer_arc
-                        .lock()
-                        .map_err(|_| "pane writer poisoned".to_string())?;
-                    if !body2.is_empty() {
-                        writer
-                            .write_all(body2.as_bytes())
-                            .map_err(|e| format!("pty write failed: {}", e))?;
-                        writer
-                            .flush()
-                            .map_err(|e| format!("pty flush failed: {}", e))?;
-                    }
-                }
-
-                Ok(())
+                write_current_dispatch_input(
+                    &session,
+                    &source_id2,
+                    &source_run_id2,
+                    &id2,
+                    &run_id2,
+                    body2.as_bytes(),
+                    true,
+                    false,
+                )
             })
             .await
             .map_err(|e| format!("blocking task join failed: {}", e))??
@@ -509,33 +763,22 @@ impl PaneStore {
             let body_len = body.chars().count() as u64;
             let delay_ms = (250 + body_len).clamp(250, 1500);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let source_id3 = source_id.clone();
+            let source_run_id3 = source_run_id.clone();
             let id3 = id.to_string();
+            let run_id3 = expected_run_id.clone();
             let session = self.session.clone();
             tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let (writer_arc, activity_arc) = {
-                    let guard = session
-                        .lock()
-                        .map_err(|_| "session map poisoned".to_string())?;
-                    let sess = guard
-                        .get(&id3)
-                        .ok_or_else(|| format!("pane not found: {}", id3))?;
-                    (sess.writer_lock.clone(), sess.activity.clone())
-                };
-                {
-                    let mut writer = writer_arc
-                        .lock()
-                        .map_err(|_| "pane writer poisoned".to_string())?;
-                    writer
-                        .write_all(b"\r")
-                        .map_err(|e| format!("pty write failed: {}", e))?;
-                    writer
-                        .flush()
-                        .map_err(|e| format!("pty flush failed: {}", e))?;
-                }
-                if let Ok(mut act) = activity_arc.lock() {
-                    act.mark_working();
-                }
-                Ok(())
+                write_current_dispatch_input(
+                    &session,
+                    &source_id3,
+                    &source_run_id3,
+                    &id3,
+                    &run_id3,
+                    b"\r",
+                    false,
+                    true,
+                )
             })
             .await
             .map_err(|e| format!("blocking task join failed: {}", e))??;
@@ -568,10 +811,13 @@ impl PaneStore {
 
             let cr_lost = {
                 let id_check = id.to_string();
+                let run_id_check = expected_run_id.clone();
                 let session_check = self.session.clone();
                 tokio::task::spawn_blocking(move || -> bool {
                     let Ok(guard) = session_check.lock() else { return false; };
-                    let Some(sess) = guard.get(&id_check) else { return false; };
+                    let Ok(sess) = session_for_run(&guard, &id_check, &run_id_check) else {
+                        return false;
+                    };
                     let Ok(act) = sess.activity.lock() else { return false; };
                     act.last_output_at < cr_send_time
                 })
@@ -584,28 +830,22 @@ impl PaneStore {
                     "coffee-cli mcp dispatch: CR appears absorbed by {}, retrying once",
                     id
                 );
+                let source_id_retry = source_id.clone();
+                let source_run_id_retry = source_run_id.clone();
                 let id_retry = id.to_string();
+                let run_id_retry = expected_run_id.clone();
                 let session_retry = self.session.clone();
                 let _ = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let writer_arc = {
-                        let guard = session_retry
-                            .lock()
-                            .map_err(|_| "session map poisoned".to_string())?;
-                        let sess = guard
-                            .get(&id_retry)
-                            .ok_or_else(|| format!("pane not found: {}", id_retry))?;
-                        sess.writer_lock.clone()
-                    };
-                    let mut writer = writer_arc
-                        .lock()
-                        .map_err(|_| "pane writer poisoned".to_string())?;
-                    writer
-                        .write_all(b"\r")
-                        .map_err(|e| format!("pty write failed: {}", e))?;
-                    writer
-                        .flush()
-                        .map_err(|e| format!("pty flush failed: {}", e))?;
-                    Ok(())
+                    write_current_dispatch_input(
+                        &session_retry,
+                        &source_id_retry,
+                        &source_run_id_retry,
+                        &id_retry,
+                        &run_id_retry,
+                        b"\r",
+                        false,
+                        false,
+                    )
                 })
                 .await;
             }
@@ -654,14 +894,13 @@ impl PaneStore {
 
             let idle = {
                 let id2 = id.to_string();
+                let run_id2 = expected_run_id.clone();
                 let session = self.session.clone();
                 tokio::task::spawn_blocking(move || -> Result<bool, String> {
                     let guard = session
                         .lock()
                         .map_err(|_| "session map poisoned".to_string())?;
-                    let sess = guard
-                        .get(&id2)
-                        .ok_or_else(|| format!("pane not found: {}", id2))?;
+                    let sess = session_for_run(&guard, &id2, &run_id2)?;
                     let mut act = sess
                         .activity
                         .lock()
@@ -709,14 +948,13 @@ impl PaneStore {
         // Phase 3: snapshot the task-scoped buffer after idle.
         let buf_after = {
             let id2 = id.to_string();
+            let run_id2 = expected_run_id.clone();
             let session = self.session.clone();
             tokio::task::spawn_blocking(move || -> Result<String, String> {
                 let guard = session
                     .lock()
                     .map_err(|_| "session map poisoned".to_string())?;
-                let sess = guard
-                    .get(&id2)
-                    .ok_or_else(|| format!("pane not found: {}", id2))?;
+                let sess = session_for_run(&guard, &id2, &run_id2)?;
                 let ring = sess
                     .output_buffer
                     .lock()
@@ -797,14 +1035,15 @@ impl PaneStore {
         .map_err(|e| format!("blocking task join failed: {}", e))?
     }
 
-    async fn mark_terminal_done(&self, id: &str) {
+    async fn mark_terminal_done(&self, id: &str, expected_run_id: &str) {
         let id = id.to_string();
+        let expected_run_id = expected_run_id.to_string();
         let session = self.session.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let Ok(guard) = session.lock() else {
                 return;
             };
-            let Some(sess) = guard.get(&id) else {
+            let Ok(sess) = session_for_run(&guard, &id, &expected_run_id) else {
                 return;
             };
             if let Ok(mut activity) = sess.activity.lock() {
@@ -814,22 +1053,26 @@ impl PaneStore {
         .await;
     }
 
-    async fn ensure_dispatch_ready(&self, id: &str) -> Result<(), String> {
+    /// Atomically inspect a target pane's readiness and snapshot the exact
+    /// launch generation that will own the dispatch. Task reservation and
+    /// every PTY write revalidate that generation afterward.
+    async fn ensure_dispatch_ready(&self, id: &str) -> Result<String, String> {
         let id = id.to_string();
         let session = self.session.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), String> {
+        tokio::task::spawn_blocking(move || -> Result<String, String> {
             let guard = session
                 .lock()
                 .map_err(|_| "session map poisoned".to_string())?;
             let sess = guard
                 .get(&id)
                 .ok_or_else(|| format!("pane not found: {id}"))?;
+            let run_id = sess.run_id.clone();
             let activity = sess
                 .activity
                 .lock()
                 .map_err(|_| "activity poisoned".to_string())?;
             match activity.native_status.as_deref() {
-                Some("idle") => Ok(()),
+                Some("idle") => Ok(run_id),
                 Some("working") | Some("wait_input") => {
                     Err("target pane's native CLI status is busy".to_string())
                 }
@@ -841,7 +1084,7 @@ impl PaneStore {
                 {
                     Err("target pane recently received a submitted prompt".to_string())
                 }
-                None => Ok(()),
+                None => Ok(run_id),
             }
         })
         .await
@@ -855,7 +1098,9 @@ impl PaneStore {
                 PaneTaskEvent {
                     job_id: record.job_id.clone(),
                     source_id: record.target_id.clone(),
+                    source_run_id: record.target_run_id.clone(),
                     target_id: record.source_id.clone(),
+                    target_run_id: record.source_run_id.clone(),
                     status: record.status.clone(),
                     error: record.error.clone(),
                 },
@@ -1176,24 +1421,29 @@ mod tests {
     fn task_lifecycle_is_structured_and_exactly_once() {
         let tasks = TaskCoordinator::new();
         let source = "tab-A::pane-1";
+        let source_run = "source-run-1";
         let target = "tab-A::pane-3";
-        let job_id = tasks.start(source, target).unwrap();
+        let target_run = "target-run-1";
+        let job_id = tasks.start(source, source_run, target, target_run).unwrap();
 
-        let running = tasks.latest_for_route(source, target).unwrap();
+        let running = tasks.latest_for_route(source, source_run, target).unwrap();
         assert_eq!(running.status, PaneTaskStatus::Running);
-        assert!(tasks.start(source, target).unwrap_err().contains("busy"));
+        assert!(tasks
+            .start(source, source_run, target, target_run)
+            .unwrap_err()
+            .contains("busy"));
 
         let (completed, is_new) = tasks
-            .complete(target, &job_id, "review complete".to_string(), None)
+            .complete(target, target_run, &job_id, "review complete".to_string(), None)
             .unwrap();
         assert!(is_new);
         assert_eq!(completed.status, PaneTaskStatus::Completed);
 
         let (_, duplicate_is_new) = tasks
-            .complete(target, &job_id, "ignored duplicate".to_string(), None)
+            .complete(target, target_run, &job_id, "ignored duplicate".to_string(), None)
             .unwrap();
         assert!(!duplicate_is_new);
-        let stored = tasks.latest_for_route(source, target).unwrap();
+        let stored = tasks.latest_for_route(source, source_run, target).unwrap();
         assert_eq!(stored.summary.as_deref(), Some("review complete"));
     }
 
@@ -1209,7 +1459,9 @@ mod tests {
                     barrier.wait();
                     tasks.start(
                         &format!("tab-A::pane-{}", index + 1),
+                        &format!("source-run-{}", index + 1),
                         "tab-A::pane-9",
+                        "target-run-1",
                     )
                 })
             })
@@ -1227,23 +1479,25 @@ mod tests {
     fn stale_or_wrong_pane_cannot_complete_a_job() {
         let tasks = TaskCoordinator::new();
         let source = "tab-A::pane-1";
+        let source_run = "source-run-1";
         let target = "tab-A::pane-2";
-        let first = tasks.start(source, target).unwrap();
+        let target_run = "target-run-1";
+        let first = tasks.start(source, source_run, target, target_run).unwrap();
         tasks
-            .complete(target, &first, "first".to_string(), None)
+            .complete(target, target_run, &first, "first".to_string(), None)
             .unwrap();
-        let second = tasks.start(source, target).unwrap();
+        let second = tasks.start(source, source_run, target, target_run).unwrap();
 
         assert!(tasks
-            .complete(target, &first, "late".to_string(), None)
+            .complete(target, target_run, &first, "late".to_string(), None)
             .unwrap_err()
             .contains("stale"));
         assert!(tasks
-            .complete("tab-A::pane-4", &second, "wrong".to_string(), None)
+            .complete("tab-A::pane-4", target_run, &second, "wrong".to_string(), None)
             .unwrap_err()
             .contains("stale"));
         assert_eq!(
-            tasks.latest_for_route(source, target).unwrap().job_id,
+            tasks.latest_for_route(source, source_run, target).unwrap().job_id,
             second
         );
     }
@@ -1252,18 +1506,20 @@ mod tests {
     fn task_results_are_visible_only_to_the_dispatching_route() {
         let tasks = TaskCoordinator::new();
         let source = "tab-A::pane-1";
+        let source_run = "source-run-1";
         let target = "tab-A::pane-2";
-        let job_id = tasks.start(source, target).unwrap();
+        let target_run = "target-run-1";
+        let job_id = tasks.start(source, source_run, target, target_run).unwrap();
         tasks
-            .complete(target, &job_id, "private result".to_string(), None)
+            .complete(target, target_run, &job_id, "private result".to_string(), None)
             .unwrap();
 
-        assert!(tasks.latest_for_route(source, target).is_some());
+        assert!(tasks.latest_for_route(source, source_run, target).is_some());
         assert!(tasks
-            .latest_for_route("tab-A::pane-3", target)
+            .latest_for_route("tab-A::pane-3", "source-run-3", target)
             .is_none());
         assert!(tasks
-            .latest_for_route("tab-B::pane-1", target)
+            .latest_for_route("tab-B::pane-1", source_run, target)
             .is_none());
     }
 
@@ -1271,32 +1527,104 @@ mod tests {
     fn target_failure_is_stored_and_routes_back_to_dispatcher() {
         let tasks = TaskCoordinator::new();
         let source = "tab-A::pane-1";
+        let source_run = "source-run-1";
         let target = "tab-A::pane-3";
-        let job_id = tasks.start(source, target).unwrap();
+        let target_run = "target-run-1";
+        let job_id = tasks.start(source, source_run, target, target_run).unwrap();
 
         let event = tasks
-            .fail_target(target, "process exited".to_string())
+            .fail_target(target, target_run, "process exited".to_string())
             .unwrap();
         assert_eq!(event.job_id, job_id);
         assert_eq!(event.source_id, target);
+        assert_eq!(event.source_run_id, target_run);
         assert_eq!(event.target_id, source);
+        assert_eq!(event.target_run_id, source_run);
         assert_eq!(event.status, PaneTaskStatus::Failed);
-        assert!(tasks.fail_target(target, "duplicate".to_string()).is_none());
+        assert!(tasks
+            .fail_target(target, target_run, "duplicate".to_string())
+            .is_none());
         assert_eq!(
-            tasks.latest_for_route(source, target).unwrap().status,
+            tasks.latest_for_route(source, source_run, target).unwrap().status,
             PaneTaskStatus::Failed
         );
+    }
+
+    #[test]
+    fn old_target_run_cannot_complete_or_fail_a_replacement_task() {
+        let tasks = TaskCoordinator::new();
+        let source = "tab-A::pane-1";
+        let target = "tab-A::pane-2";
+        let old_source_run = "source-run-old";
+        let old_target_run = "target-run-old";
+        let new_source_run = "source-run-new";
+        let new_target_run = "target-run-new";
+
+        let old_job = tasks
+            .start(source, old_source_run, target, old_target_run)
+            .unwrap();
+
+        // A replacement target has a different generation. Its lifecycle
+        // cleanup may end the old job, but an old endpoint must never affect
+        // the new one after that cleanup.
+        let old_event = tasks
+            .fail_target(target, old_target_run, "target restarted".to_string())
+            .unwrap();
+        assert_eq!(old_event.target_id, source);
+        assert_eq!(old_event.target_run_id, old_source_run);
+
+        let new_job = tasks
+            .start(source, new_source_run, target, new_target_run)
+            .unwrap();
+        assert!(tasks
+            .complete(
+                target,
+                old_target_run,
+                &new_job,
+                "old endpoint result".to_string(),
+                None,
+            )
+            .unwrap_err()
+            .contains("previous target pane run"));
+        assert!(tasks
+            .fail_target(target, old_target_run, "late old exit".to_string())
+            .is_none());
+
+        // The replacement remains live and only its own source run can read
+        // it. The old dispatcher's route cannot inherit the new result.
+        assert_eq!(
+            tasks
+                .latest_for_route(source, new_source_run, target)
+                .unwrap()
+                .job_id,
+            new_job
+        );
+        assert!(tasks
+            .latest_for_route(source, old_source_run, target)
+            .is_some());
+        assert!(tasks
+            .complete(
+                target,
+                new_target_run,
+                &old_job,
+                "late old job".to_string(),
+                None,
+            )
+            .unwrap_err()
+            .contains("stale"));
     }
 
     #[test]
     fn coordinator_prunes_old_terminal_jobs() {
         let tasks = TaskCoordinator::new();
         let source = "tab-A::pane-1";
+        let source_run = "source-run-1";
         let target = "tab-A::pane-2";
+        let target_run = "target-run-1";
         for index in 0..300 {
-            let job_id = tasks.start(source, target).unwrap();
+            let job_id = tasks.start(source, source_run, target, target_run).unwrap();
             tasks
-                .complete(target, &job_id, format!("result {index}"), None)
+                .complete(target, target_run, &job_id, format!("result {index}"), None)
                 .unwrap();
         }
         assert!(tasks.state.lock().unwrap().records.len() <= 256);
@@ -1338,20 +1666,29 @@ pub struct CoffeeMcp {
     /// The pane this MCP server instance is dedicated to — i.e. "the
     /// caller's identity, baked in at spawn time". Each multi-agent
     /// pane spawns its own MCP server bound to its own port, with
-    /// its own `self_pane_id` set. `None` means the server is
+    /// its own `self_pane_id` and launch generation set. `None` means the server is
     /// anonymous (legacy / non-multi-agent mode); in that case
     /// `whoami` returns an error and `list_panes` doesn't mark
     /// `is_self`.
     self_pane_id: Option<String>,
+    /// Launch generation paired with `self_pane_id`. It is intentionally
+    /// never surfaced to the model, but it authenticates every mutating
+    /// operation against the live terminal session.
+    self_run_id: Option<String>,
 }
 
 #[tool_router]
 impl CoffeeMcp {
-    pub fn new(panes: Arc<PaneStore>, self_pane_id: Option<String>) -> Self {
+    pub fn new(
+        panes: Arc<PaneStore>,
+        self_pane_id: Option<String>,
+        self_run_id: Option<String>,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             panes,
             self_pane_id,
+            self_run_id,
         }
     }
 
@@ -1467,28 +1804,60 @@ cross-tab dispatch, and dispatch to a pane with a running job are rejected."
                 .to_string(),
             )]));
         };
-
-        if let Err(error) = self.panes.ensure_dispatch_ready(&target_id).await {
+        let Some(source_run_id) = self.self_run_id.as_deref() else {
             return Ok(CallToolResult::success(vec![Content::text(
                 serde_json::json!({
-                    "status": "busy",
-                    "pane_id": pane_short(&target_id),
-                    "error": error,
-                    "instruction": "Do not write to or poll this pane. Choose another idle pane or wait until the human-visible task finishes."
+                    "status": "failed",
+                    "error": "send_to_pane requires a launch-generation-bound pane endpoint"
+                })
+                .to_string(),
+            )]));
+        };
+        if let Err(error) = self.panes.ensure_current_run(source_id, source_run_id).await {
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({
+                    "status": "failed",
+                    "error": format!("this MCP endpoint belongs to a superseded pane run: {error}")
                 })
                 .to_string(),
             )]));
         }
 
-        // Multi-agent dispatch is one-shot: reserve an identity-bound job
-        // before touching the PTY. This makes concurrent/busy dispatches fail
-        // atomically instead of being merged into a running agent turn.
-        let job_id = match self.panes.tasks.start(source_id, &target_id) {
-            Ok(job_id) => job_id,
+        let target_run_id = match self.panes.ensure_dispatch_ready(&target_id).await {
+            Ok(run_id) => run_id,
             Err(error) => {
                 return Ok(CallToolResult::success(vec![Content::text(
                     serde_json::json!({
                         "status": "busy",
+                        "pane_id": pane_short(&target_id),
+                        "error": error,
+                        "instruction": "Do not write to or poll this pane. Choose another idle pane or wait until the human-visible task finishes."
+                    })
+                    .to_string(),
+                )]));
+            }
+        };
+
+        // Multi-agent dispatch is one-shot: reserve an identity-bound job
+        // before touching the PTY. The source and target generation checks
+        // are part of that same transition, so an old endpoint cannot pass a
+        // preliminary check, wait for readiness, and then enqueue work after
+        // its pane has been replaced.
+        let job_id = match self
+            .panes
+            .start_task_for_current_runs(source_id, source_run_id, &target_id, &target_run_id)
+            .await
+        {
+            Ok(job_id) => job_id,
+            Err(error) => {
+                let status = if error.starts_with("dispatching pane is no longer current") {
+                    "failed"
+                } else {
+                    "busy"
+                };
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::json!({
+                        "status": status,
                         "pane_id": pane_short(&target_id),
                         "error": error,
                         "instruction": "Do not write to or poll this pane. Choose another idle pane or wait for the existing task's completion notification."
@@ -1526,7 +1895,16 @@ cross-tab dispatch, and dispatch to a pane with a running job are rejected."
 
         match self
             .panes
-            .dispatch(&target_id, &dispatch_text, submit, wait, timeout_sec)
+            .dispatch(
+                source_id,
+                source_run_id,
+                &target_id,
+                &target_run_id,
+                &dispatch_text,
+                submit,
+                wait,
+                timeout_sec,
+            )
             .await
         {
             Ok(result) => {
@@ -1580,6 +1958,24 @@ absolute path as result_path. After success, end your turn."
                 .to_string(),
             )]));
         };
+        let Some(target_run_id) = self.self_run_id.as_deref() else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({
+                    "status": "failed",
+                    "error": "complete_task requires a launch-generation-bound pane endpoint"
+                })
+                .to_string(),
+            )]));
+        };
+        if let Err(error) = self.panes.ensure_current_run(target_id, target_run_id).await {
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({
+                    "status": "failed",
+                    "error": format!("this MCP endpoint belongs to a superseded pane run: {error}")
+                })
+                .to_string(),
+            )]));
+        }
         let (summary, result_path) = match validate_completion_payload(args.summary, args.result_path) {
             Ok(payload) => payload,
             Err(error) => {
@@ -1591,11 +1987,17 @@ absolute path as result_path. After success, end your turn."
 
         match self
             .panes
-            .tasks
-            .complete(target_id, &args.job_id, summary, result_path)
+            .complete_task_for_current_run(
+                target_id,
+                target_run_id,
+                &args.job_id,
+                summary,
+                result_path,
+            )
+            .await
         {
             Ok((record, is_new)) => {
-                self.panes.mark_terminal_done(target_id).await;
+                self.panes.mark_terminal_done(target_id, target_run_id).await;
                 if is_new {
                     if let Err(error) = self.panes.emit_task_event(&record) {
                         return Ok(CallToolResult::success(vec![Content::text(
@@ -1657,8 +2059,23 @@ Never poll progress, sleep, wait, or repeatedly call read_pane after send_to_pan
             .unwrap_or(READ_PANE_DEFAULT_LINES)
             .clamp(1, READ_PANE_MAX_LINES);
 
-        if let Some(source_id) = self.self_pane_id.as_deref() {
-            if let Some(record) = self.panes.tasks.latest_for_route(source_id, &target_id) {
+        if let (Some(source_id), Some(source_run_id)) =
+            (self.self_pane_id.as_deref(), self.self_run_id.as_deref())
+        {
+            if let Err(error) = self.panes.ensure_current_run(source_id, source_run_id).await {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::json!({
+                        "status": "failed",
+                        "error": format!("this MCP endpoint belongs to a superseded pane run: {error}")
+                    })
+                    .to_string(),
+                )]));
+            }
+            if let Some(record) = self
+                .panes
+                .tasks
+                .latest_for_route(source_id, source_run_id, &target_id)
+            {
                 let payload = match record.status {
                     PaneTaskStatus::Running => serde_json::json!({
                         "status": "working",
@@ -1828,7 +2245,7 @@ async fn mcp_request_middleware(
 /// tokio task; caller can drop the returned value (server keeps running
 /// for the lifetime of the tokio runtime).
 ///
-/// `self_pane_id` bakes a specific pane identity into THIS server
+/// `self_pane_id` and `self_run_id` bake a specific pane launch identity into THIS server
 /// instance: every tool call to it is treated as coming from that pane.
 /// Pass `None` for an "anonymous" server (legacy / non-multi-agent),
 /// or `Some(pane_id)` to make `whoami()`, `is_self` in `list_panes`,
@@ -1837,8 +2254,9 @@ async fn mcp_request_middleware(
 pub async fn spawn(
     panes: Arc<PaneStore>,
     self_pane_id: Option<String>,
+    self_run_id: Option<String>,
 ) -> anyhow::Result<McpEndpoint> {
-    spawn_with_port(panes, self_pane_id, 0).await
+    spawn_with_port(panes, self_pane_id, self_run_id, 0).await
 }
 
 /// Like `spawn`, but lets the caller request a specific port.
@@ -1851,13 +2269,15 @@ pub async fn spawn(
 pub async fn spawn_with_port(
     panes: Arc<PaneStore>,
     self_pane_id: Option<String>,
+    self_run_id: Option<String>,
     preferred_port: u16,
 ) -> anyhow::Result<McpEndpoint> {
     let service = StreamableHttpService::new(
         {
             let panes = panes.clone();
             let pane_id = self_pane_id.clone();
-            move || Ok(CoffeeMcp::new(panes.clone(), pane_id.clone()))
+            let run_id = self_run_id.clone();
+            move || Ok(CoffeeMcp::new(panes.clone(), pane_id.clone(), run_id.clone()))
         },
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),

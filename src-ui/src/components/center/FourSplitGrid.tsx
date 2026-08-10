@@ -191,7 +191,8 @@ export function FourSplitGrid({ tab, hasBg, bgUrl, bgType, paneCount = 4 }: Prop
                 aria-label={`Close pane ${pane.paneIdx}`}
                 onClick={(e) => {
                   e.stopPropagation();
-                  commands.tierTerminalKill(paneSid).catch(() => {});
+                  // TierTerminal owns the runId and performs the guarded
+                  // cleanup from its unmount effect after this dispatch.
                   if (focusedPaneIdx === pane.paneIdx) {
                     setFocusedPaneIdx(null);
                     setFocusedPane(tab.id, null);
@@ -231,6 +232,7 @@ export function FourSplitGrid({ tab, hasBg, bgUrl, bgType, paneCount = 4 }: Prop
                     // tab.folderPath only if somehow a pane got filled
                     // without going through onSelectTool (defensive).
                     folderPath={pane.folderPath ?? tab.folderPath}
+                    mcpSelection={pane.mcpSelection}
                     hasBg={hasBg}
                     bgUrl=""
                     bgType="none"

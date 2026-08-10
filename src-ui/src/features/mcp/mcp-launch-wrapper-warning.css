@@ -1,0 +1,50 @@
+.mcp-launch-wrapper-warning {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 5px;
+  min-width: 0;
+  color: #d49a2a;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.mcp-launch-wrapper-warning svg {
+  flex: 0 0 12px;
+  width: 12px;
+  height: 12px;
+  margin-top: 1px;
+}
+
+.mcp-launch-wrapper-warning span {
+  min-width: 0;
+}
+
+.mcp-launch-wrapper-warning--card {
+  max-width: 100%;
+}
+
+.mcp-launch-wrapper-warning--card span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-launch-wrapper-warning--pane {
+  max-width: min(100%, 300px);
+  text-align: center;
+}
+
+/* CenterPanel's generic card typography targets every nested span. Keep this
+ * operational warning compact instead of inheriting the agent-name scale. */
+.launchpad-card .mcp-launch-wrapper-warning,
+.launchpad-card .mcp-launch-wrapper-warning span {
+  color: #d49a2a;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.launchpad-card .mcp-launch-wrapper-warning span {
+  white-space: nowrap;
+}

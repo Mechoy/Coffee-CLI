@@ -344,6 +344,30 @@
   right: 16px;
 }
 
+.launchpad-mcp-select {
+  position: absolute;
+  top: 18px;
+  right: 58px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
+  color: var(--text-3);
+  font-size: 10px;
+}
+.launchpad-mcp-select select {
+  max-width: 130px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text-1);
+  font-size: 11px;
+}
+
 /* Library chrome: back button at top-left. */
 .launchpad-chrome--library > .launchpad-chrome-back {
   position: absolute;

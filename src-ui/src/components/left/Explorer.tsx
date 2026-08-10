@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { useAppState } from '../../store/app-state';
+import { isMultiAgentTool, useAppState } from '../../store/app-state';
 import type { IconTheme, ToolType } from '../../store/app-state';
 import { useT } from '../../i18n/useT';
 import { isMaskTintTheme } from '../../lib/personalization';
@@ -675,10 +675,27 @@ export function Explorer() {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({ directory: true });
       if (selected && typeof selected === 'string') {
+        // Choosing the current folder is a no-op. Restarting coordinated panes
+        // here would retain their old native identities while making them look
+        // like a fresh workspace boundary.
+        if (selected === activeSession?.folderPath) return;
         const activeTerminalId = state.activeTerminalId;
         const tool = activeSession?.tool;
 
         if (activeTerminalId && tool) {
+          // The folder picker starts a fresh coordinated workspace. Revoke
+          // any old restore permits before changing the tab identity so an
+          // async, no-longer-mounted pane cannot consume its former lease.
+          const restoreAttemptId = activeSession?.multiAgentRestoreAttemptId;
+          if (restoreAttemptId && isMultiAgentTool(tool)) {
+            try {
+              await commands.releaseMultiAgentWorkspaceRestore(restoreAttemptId);
+            } catch (error) {
+              // The backend also reclaims abandoned unclaimed leases. A
+              // release failure must not make selecting a project impossible.
+              console.warn('[Explorer] Failed to release workspace restore:', error);
+            }
+          }
           // 1. Update this tab's folderPath so the restarted terminal knows its CWD
           dispatch({ type: 'SET_FOLDER', path: selected });
 

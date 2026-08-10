@@ -54,7 +54,7 @@ const RESUME_FLUSH_SYNC = 256 * 1024; // 256 KB
 const DROP_WARNING =
   '\r\n\x1b[33m[Coffee CLI: 后台输出积压超过 2MB,已丢弃部分历史输出。切回此 tab 查看实时输出,完整对话见 session 文件]\x1b[0m\r\n';
 
-// ── Per-session state ────────────────────────────────────────────────────────
+// ── Per-run state ────────────────────────────────────────────────────────────
 
 interface SessionQueue {
   term: Terminal;
@@ -70,13 +70,19 @@ interface SessionQueue {
 
 const sessions = new Map<string, SessionQueue>();
 
+function terminalRunKey(sessionId: string, runId: string): string {
+  // Session ids and generated UUID run ids cannot contain NUL, so this keeps
+  // concurrent restart-in-place runs distinct without allocating nested maps.
+  return `${sessionId}\0${runId}`;
+}
+
 /** Single shared drain timer across all background sessions. null = idle. */
 let sharedDrainTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-export function registerSession(id: string, term: Terminal): void {
-  sessions.set(id, {
+export function registerSession(sessionId: string, runId: string, term: Terminal): void {
+  sessions.set(terminalRunKey(sessionId, runId), {
     term,
     chunks: [],
     bytes: 0,
@@ -93,8 +99,8 @@ export function registerSession(id: string, term: Terminal): void {
   });
 }
 
-export function unregisterSession(id: string): void {
-  sessions.delete(id);
+export function unregisterSession(sessionId: string, runId: string): void {
+  sessions.delete(terminalRunKey(sessionId, runId));
   // If the shared timer is now idle (no bg sessions left), cancel it.
   if (sharedDrainTimer !== null && !hasBgWork()) {
     clearTimeout(sharedDrainTimer);
@@ -106,8 +112,8 @@ export function unregisterSession(id: string): void {
  *  buffer (2MB lossy). Called from TierTerminal's onOutput handler INSTEAD OF
  *  `term.write(data)` — all other per-chunk tracking (hasOutput, alt-screen,
  *  SSH password detection) stays in the handler and runs synchronously before this. */
-export function enqueue(id: string, data: string): void {
-  const q = sessions.get(id);
+export function enqueue(sessionId: string, runId: string, data: string): void {
+  const q = sessions.get(terminalRunKey(sessionId, runId));
   if (!q) return;
   if (q.isActive) {
     // Foreground: xterm.write queues internally + paces via its own WriteBuffer
@@ -138,8 +144,8 @@ export function enqueue(id: string, data: string): void {
 /** Flip a session between foreground (immediate write) and background
  *  (buffered drain). On fg, runs the bounded resume drain (Phase 3) so a tab
  *  that accumulated output while hidden doesn't beachball on switch-back. */
-export function setActive(id: string, active: boolean): void {
-  const q = sessions.get(id);
+export function setActive(sessionId: string, runId: string, active: boolean): void {
+  const q = sessions.get(terminalRunKey(sessionId, runId));
   if (!q) return;
   q.isActive = active;
   if (active) {

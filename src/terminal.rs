@@ -206,12 +206,14 @@ fn ensure_claude_theme_auto() {
 #[derive(Serialize, Clone)]
 pub struct TerminalOutput {
     pub id: String,
+    pub run_id: String,
     pub data: String,
 }
 
 #[derive(Serialize, Clone)]
 pub struct TerminalStatus {
     pub id: String,
+    pub run_id: String,
     pub running: bool,
     pub exit_code: Option<i32>,
 }
@@ -225,6 +227,7 @@ pub struct TerminalStatus {
 #[derive(Serialize, Clone)]
 pub struct TerminalExitEvent {
     pub id: String,
+    pub run_id: String,
     pub exit_code: i32,
 }
 
@@ -428,6 +431,18 @@ pub fn find_preset(tool_name: &str) -> Option<&'static AgentPreset> {
 // ─── Shared Session State ─────────────────────────────────
 
 pub struct TerminalSession {
+    /// Unique launch generation for this logical terminal id. A restarted
+    /// pane gets a new value so delayed events and cleanup from the old PTY
+    /// cannot affect the replacement session.
+    pub run_id: String,
+    /// Serializes retirement of this generation with coordinated MCP writes.
+    /// A dispatcher holds the source and target gates while it writes a task;
+    /// replacement/exit takes this gate before marking the run unavailable.
+    pub run_lifecycle_lock: Arc<Mutex<()>>,
+    /// False once this exact generation is being replaced, stopped, or has
+    /// exited. The Arc remains valid for in-flight MCP requests that captured
+    /// the old session before its map entry changed.
+    pub run_is_live: Arc<AtomicBool>,
     /// Cloneable Arc for write operations — lets callers release the session map
     /// lock before doing PTY I/O, preventing multi-tab starvation.
     pub writer_lock: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -461,6 +476,250 @@ pub struct TerminalSession {
 }
 
 pub type SharedSession = Arc<Mutex<std::collections::HashMap<String, TerminalSession>>>;
+
+/// Optional backend-only sink for a verified native resume token. The terminal
+/// reader invokes it only after it has confirmed the same logical terminal is
+/// still owned by this exact run generation. It keeps workspace recovery token
+/// persistence out of the WebView and prevents delayed old output from being
+/// attributed to a replacement PTY.
+pub type SessionTokenSink = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Mark a generation unavailable without waiting for an in-flight PTY write.
+/// This is used by an explicit stop or an observed child exit, where the
+/// caller must be able to send the kill signal even if stdin is back-pressured.
+pub fn deactivate_session_generation(
+    sessions: &SharedSession,
+    session_id: &str,
+    run_id: &str,
+) -> bool {
+    let Ok(map) = sessions.lock() else {
+        return false;
+    };
+    let Some(session) = map.get(session_id) else {
+        return false;
+    };
+    if session.run_id != run_id {
+        return false;
+    }
+    session.run_is_live.store(false, Ordering::Release);
+    true
+}
+
+/// Install a replacement only after the previous generation's active PTY
+/// write has finished. The lifecycle gate is acquired before the session map,
+/// so a back-pressured write can delay only this pane's replacement and never
+/// hold the global map hostage.
+enum SessionInstallOutcome {
+    Installed(Option<TerminalSession>),
+    Cancelled,
+}
+
+fn install_session_generation(
+    sessions: &SharedSession,
+    launches: &SharedLaunchRegistry,
+    session_id: &str,
+    run_id: &str,
+    next: TerminalSession,
+) -> Result<SessionInstallOutcome, String> {
+    loop {
+        let previous_gate = {
+            let map = sessions
+                .lock()
+                .map_err(|_| "session map poisoned".to_string())?;
+            map.get(session_id)
+                .map(|session| session.run_lifecycle_lock.clone())
+        };
+
+        let Some(previous_gate) = previous_gate else {
+            let registry = launches
+                .lock()
+                .map_err(|_| "launch registry poisoned".to_string())?;
+            if !registry.is_current(session_id, run_id) {
+                return Ok(SessionInstallOutcome::Cancelled);
+            }
+            let mut map = sessions
+                .lock()
+                .map_err(|_| "session map poisoned".to_string())?;
+            if map.contains_key(session_id) {
+                continue;
+            }
+            return Ok(SessionInstallOutcome::Installed(
+                map.insert(session_id.to_string(), next),
+            ));
+        };
+
+        let _gate = previous_gate
+            .lock()
+            .map_err(|_| "pane lifecycle gate poisoned".to_string())?;
+        // The kill path needs this registry to cancel and send kill_tx while
+        // a replacement waits on a back-pressured PTY write. Only take it
+        // after the gate is available, then keep the final current-run check
+        // and map installation atomic with respect to cancellation.
+        let registry = launches
+            .lock()
+            .map_err(|_| "launch registry poisoned".to_string())?;
+        if !registry.is_current(session_id, run_id) {
+            return Ok(SessionInstallOutcome::Cancelled);
+        }
+        let mut map = sessions
+            .lock()
+            .map_err(|_| "session map poisoned".to_string())?;
+        let still_previous = map.get(session_id).is_some_and(|session| {
+            Arc::ptr_eq(&session.run_lifecycle_lock, &previous_gate)
+        });
+        if !still_previous {
+            continue;
+        }
+        if let Some(previous) = map.get(session_id) {
+            previous.run_is_live.store(false, Ordering::Release);
+        }
+        return Ok(SessionInstallOutcome::Installed(
+            map.insert(session_id.to_string(), next),
+        ));
+    }
+}
+
+/// Remove a terminal generation after its emitter has finished. Like
+/// installation, this waits on only the affected generation's gate before it
+/// touches the shared session map.
+pub fn remove_session_generation(
+    sessions: &SharedSession,
+    session_id: &str,
+    run_id: &str,
+) -> bool {
+    loop {
+        let lifecycle_gate = {
+            let Ok(map) = sessions.lock() else {
+                return false;
+            };
+            let Some(session) = map.get(session_id) else {
+                return false;
+            };
+            if session.run_id != run_id {
+                return false;
+            }
+            session.run_lifecycle_lock.clone()
+        };
+
+        let Ok(_gate) = lifecycle_gate.lock() else {
+            return false;
+        };
+        let Ok(mut map) = sessions.lock() else {
+            return false;
+        };
+        let still_current = map.get(session_id).is_some_and(|session| {
+            session.run_id == run_id && Arc::ptr_eq(&session.run_lifecycle_lock, &lifecycle_gate)
+        });
+        if !still_current {
+            if map
+                .get(session_id)
+                .is_none_or(|session| session.run_id != run_id)
+            {
+                return false;
+            }
+            continue;
+        }
+        if let Some(session) = map.get(session_id) {
+            session.run_is_live.store(false, Ordering::Release);
+        }
+        map.remove(session_id);
+        return true;
+    }
+}
+
+/// Tracks the newest launch generation for each logical terminal id. PTY
+/// startup crosses async and blocking boundaries, so a component can unmount
+/// (and send kill) before its child is inserted into `SharedSession`. Keeping
+/// a short cancelled-run tombstone closes that otherwise orphaning window.
+pub struct TerminalLaunchRegistry {
+    active_runs: std::collections::HashMap<String, String>,
+    cancelled_runs: std::collections::VecDeque<(String, String)>,
+}
+
+pub type SharedLaunchRegistry = Arc<Mutex<TerminalLaunchRegistry>>;
+
+impl Default for TerminalLaunchRegistry {
+    fn default() -> Self {
+        Self {
+            active_runs: std::collections::HashMap::new(),
+            cancelled_runs: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl TerminalLaunchRegistry {
+    const MAX_CANCELLED_RUNS: usize = 128;
+
+    /// Reserve a run before any async MCP setup starts. Returns false when a
+    /// matching kill reached the backend before this delayed start command,
+    /// or when a duplicate request attempts to start the live generation a
+    /// second time.
+    pub fn reserve(&mut self, session_id: &str, run_id: &str) -> bool {
+        if let Some(position) = self
+            .cancelled_runs
+            .iter()
+            .position(|(session, run)| session == session_id && run == run_id)
+        {
+            self.cancelled_runs.remove(position);
+            return false;
+        }
+        if self
+            .active_runs
+            .get(session_id)
+            .is_some_and(|active| active == run_id)
+        {
+            return false;
+        }
+        self.active_runs
+            .insert(session_id.to_string(), run_id.to_string());
+        true
+    }
+
+    pub fn is_current(&self, session_id: &str, run_id: &str) -> bool {
+        self.active_runs
+            .get(session_id)
+            .is_some_and(|active| active == run_id)
+            && !self
+                .cancelled_runs
+                .iter()
+                .any(|(session, run)| session == session_id && run == run_id)
+    }
+
+    /// Mark a generation cancelled even when its PTY has not been inserted
+    /// yet. The bounded tombstone is consumed by a delayed start command.
+    pub fn cancel(&mut self, session_id: &str, run_id: &str) {
+        if self
+            .active_runs
+            .get(session_id)
+            .is_some_and(|active| active == run_id)
+        {
+            self.active_runs.remove(session_id);
+        }
+        if !self
+            .cancelled_runs
+            .iter()
+            .any(|(session, run)| session == session_id && run == run_id)
+        {
+            self.cancelled_runs
+                .push_back((session_id.to_string(), run_id.to_string()));
+            while self.cancelled_runs.len() > Self::MAX_CANCELLED_RUNS {
+                self.cancelled_runs.pop_front();
+            }
+        }
+    }
+
+    /// Clear only the matching active generation. A delayed old reader must
+    /// never erase the registration of a newer replacement session.
+    pub fn finish(&mut self, session_id: &str, run_id: &str) {
+        if self
+            .active_runs
+            .get(session_id)
+            .is_some_and(|active| active == run_id)
+        {
+            self.active_runs.remove(session_id);
+        }
+    }
+}
 
 pub struct SessionActivity {
     pub last_output_at: Instant,
@@ -559,7 +818,9 @@ impl TerminalOutputBuffer {
 pub fn spawn(
     app: AppHandle,
     session_id: String,
+    run_id: String,
     session: SharedSession,
+    launch_registry: SharedLaunchRegistry,
     program: String,
     args: Vec<String>,
     cwd: Option<String>,
@@ -570,15 +831,25 @@ pub fn spawn(
     theme_mode: Option<String>,
     locale: Option<String>,
     extra_env: Vec<(String, String)>,
-) -> anyhow::Result<()> {
+    token_sink: Option<SessionTokenSink>,
+) -> anyhow::Result<bool> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     // Default to at least 120 cols so wide terminal output (help screens,
     // table output, etc.) doesn't wrap aggressively in small windows.
     let cols = initial_cols.max(120);
     let rows = initial_rows.max(24);
-    eprintln!("[Tier Terminal] Spawning '{}' args={:?}", program, args);
+    // Args may contain a native resume token or a user-supplied secret. Do not
+    // render them into persistent application logs.
+    eprintln!("[Tier Terminal] Spawning '{}' ({} args)", program, args.len());
     eprintln!("[Tier Terminal] Size: {}x{}", cols, rows);
+    if !launch_registry
+        .lock()
+        .map(|registry| registry.is_current(&session_id, &run_id))
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
 
     // ── Build command ──────────────────────────────────────────────────────
     // On Windows: npm-installed tools are .cmd scripts, not real .exe files.
@@ -820,7 +1091,14 @@ pub fn spawn(
     // the child at all; if the child crashed but the PTY slave stayed open
     // (via an intermediate cmd.exe on Windows, or grandchild process on any
     // OS), reader.read() would block forever and the UI had no way to know.
-    let child = pair.slave.spawn_command(cmd)?;
+    if !launch_registry
+        .lock()
+        .map(|registry| registry.is_current(&session_id, &run_id))
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let mut child = pair.slave.spawn_command(cmd)?;
     eprintln!("[Tier Terminal] PTY process spawned OK (portable-pty)");
 
     // Bind the new child to the kill-on-close Job Object so it can't outlive
@@ -860,56 +1138,6 @@ pub fn spawn(
         }
     });
 
-    // ── Child exit watcher ─────────────────────────────────────────────────
-    // Coffee CLI's primary "terminal locks up after a while" failure mode:
-    // the child process (claude / node.js / etc.) dies, but an intermediate
-    // cmd.exe parent or grandchild process keeps the PTY slave open, so the
-    // reader thread never sees EOF — it blocks on read() forever and the
-    // frontend sees a frozen terminal with no explanation.
-    //
-    // Fix: own the Child handle in a dedicated thread that blocks on
-    // child.wait(). When wait() returns, we KNOW the process is dead.
-    // Actions on exit:
-    //   1. Emit "tier-terminal-exit" with the real exit code — the frontend
-    //      shows a "process exited — click to restart" overlay instead of a
-    //      frozen-looking terminal.
-    //   2. Force-drop the PTY master → reader thread gets EOF → normal
-    //      cleanup path runs (ticker stops, session removed from map,
-    //      tier-terminal-status fires).
-    //
-    // This is the SOLE new lifecycle signal; the existing reader-EOF cleanup
-    // path remains the one place that removes the session from the map.
-    let master_for_watcher = master_arc.clone();
-    let app_for_watcher = app.clone();
-    let sid_for_watcher = session_id.clone();
-    std::thread::spawn(move || {
-        let mut child = child;
-        let exit_code = match child.wait() {
-            Ok(status) => {
-                let code = status.exit_code() as i32;
-                eprintln!("[Tier Terminal] Child exited with code {}", code);
-                code
-            }
-            Err(e) => {
-                eprintln!("[Tier Terminal] child.wait() failed: {}", e);
-                -1
-            }
-        };
-        let _ = app_for_watcher.emit(
-            "tier-terminal-exit",
-            TerminalExitEvent {
-                id: sid_for_watcher.clone(),
-                exit_code,
-            },
-        );
-        // Force PTY master drop → reader thread gets EOF → cleanup path runs.
-        // Safe even if already dropped by the kill thread (guard just goes
-        // from None to None).
-        if let Ok(mut guard) = master_for_watcher.lock() {
-            *guard = None;
-        }
-    });
-
     // Defaults INACTIVE: a freshly-spawned tab emits at the 200ms background
     // cadence until the frontend's IntersectionObserver confirms it's visible
     // (set_session_active(true)). Prevents a new tab from blasting ~125
@@ -928,15 +1156,30 @@ pub fn spawn(
 
     // Store session with shared writer reference and master kept alive.
     let output_buffer = Arc::new(Mutex::new(TerminalOutputBuffer::new()));
-    {
+    let run_lifecycle_lock = Arc::new(Mutex::new(()));
+    let run_is_live = Arc::new(AtomicBool::new(true));
+    let replaced_session = {
+        let launch_is_current = launch_registry
+            .lock()
+            .map_err(|error| anyhow::anyhow!("Launch registry lock poisoned: {error}"))?
+            .is_current(&session_id, &run_id);
+        if !launch_is_current {
+            let _ = child.kill();
+            return Ok(false);
+        }
         let writer_clone = writer.clone();
         let master_clone = master_arc.clone();
         let activity_clone = activity.clone();
         let buffer_clone = output_buffer.clone();
-        let mut map = session.lock().unwrap();
-        map.insert(
-            session_id.clone(),
+        install_session_generation(
+            &session,
+            &launch_registry,
+            &session_id,
+            &run_id,
             TerminalSession {
+                run_id: run_id.clone(),
+                run_lifecycle_lock,
+                run_is_live,
                 writer_lock: writer_clone,
                 kill_tx,
                 tool_name: tool_name.clone(),
@@ -946,8 +1189,55 @@ pub fn spawn(
                 output_buffer: buffer_clone,
                 is_tab_active: is_tab_active.clone(),
             },
-        );
+        )
+        .map_err(|error| anyhow::anyhow!("Session install failed: {error}"))?
+    };
+    let replaced_session = match replaced_session {
+        SessionInstallOutcome::Installed(previous) => previous,
+        SessionInstallOutcome::Cancelled => {
+            let _ = child.kill();
+            return Ok(false);
+        }
+    };
+    // A duplicate start for the same logical terminal must not leave the old
+    // PTY running. Its reader/watcher still owns its generation and can only
+    // clean up matching state, while this signal releases its master now.
+    if let Some(previous) = replaced_session {
+        let _ = previous.kill_tx.send(());
     }
+
+    // ── Child exit watcher ─────────────────────────────────────────────────
+    // The reader can stay blocked after a direct child exits if an
+    // intermediate process keeps the PTY slave open. A dedicated wait thread
+    // provides the authoritative exit signal and force-drops the master.
+    let master_for_watcher = master_arc.clone();
+    let app_for_watcher = app.clone();
+    let sid_for_watcher = session_id.clone();
+    let run_id_for_watcher = run_id.clone();
+    std::thread::spawn(move || {
+        let exit_code = match child.wait() {
+            Ok(status) => {
+                let code = status.exit_code() as i32;
+                eprintln!("[Tier Terminal] Child exited with code {}", code);
+                code
+            }
+            Err(e) => {
+                eprintln!("[Tier Terminal] child.wait() failed: {}", e);
+                -1
+            }
+        };
+        let _ = app_for_watcher.emit(
+            "tier-terminal-exit",
+            TerminalExitEvent {
+                id: sid_for_watcher,
+                run_id: run_id_for_watcher,
+                exit_code,
+            },
+        );
+        if let Ok(mut guard) = master_for_watcher.lock() {
+            *guard = None;
+        }
+    });
 
     // Build session ID regex if this tool supports resume
     let session_id_regex = tool_name
@@ -962,6 +1252,8 @@ pub fn spawn(
     let session_for_token = session.clone();
     let session_for_cleanup = session.clone();
     let sid_cleanup = session_id.clone();
+    let run_id_for_emitter = run_id.clone();
+    let launch_registry_for_cleanup = launch_registry.clone();
 
     // ── PTY reader + emitter (zellij-inspired split) ─────────────────────────
     //
@@ -1036,6 +1328,7 @@ pub fn spawn(
     let activity_for_emitter = activity.clone();
     let output_buffer_for_emitter = output_buffer.clone();
     let is_active_for_emitter = is_tab_active.clone();
+    let token_sink_for_emitter = token_sink;
 
     std::thread::spawn(move || {
         use std::sync::mpsc::RecvTimeoutError;
@@ -1067,6 +1360,7 @@ pub fn spawn(
         #[derive(Serialize, Clone)]
         struct CwdPayload {
             id: String,
+            run_id: String,
             cwd: String,
         }
 
@@ -1146,15 +1440,21 @@ pub fn spawn(
                         if let Some(caps) = re.captures(&stripped) {
                             if let Some(token) = caps.get(1) {
                                 let token_str = token.as_str().to_string();
-                                eprintln!(
-                                    "[Tier Terminal] Captured session token: {}...",
-                                    &token_str[..token_str.len().min(12)]
-                                );
+                                let mut captured_for_current_run = false;
                                 if let Ok(map) = session_for_token.lock() {
                                     if let Some(sess) = map.get(&session_id_out) {
-                                        if let Ok(mut t) = sess.session_token.lock() {
-                                            *t = Some(token_str);
+                                        if sess.run_id == run_id_for_emitter {
+                                            if let Ok(mut t) = sess.session_token.lock() {
+                                                *t = Some(token_str.clone());
+                                                captured_for_current_run = true;
+                                            }
                                         }
+                                    }
+                                }
+                                if captured_for_current_run {
+                                    eprintln!("[Tier Terminal] Captured native session token for current run");
+                                    if let Some(sink) = token_sink_for_emitter.as_ref() {
+                                        sink(token_str);
                                     }
                                 }
                                 token_captured = true;
@@ -1175,6 +1475,7 @@ pub fn spawn(
                     "tier-terminal-output",
                     TerminalOutput {
                         id: session_id_out.clone(),
+                        run_id: run_id_for_emitter.clone(),
                         data,
                     },
                 );
@@ -1185,6 +1486,7 @@ pub fn spawn(
                         "tier-terminal-cwd",
                         CwdPayload {
                             id: session_id_out.clone(),
+                            run_id: run_id_for_emitter.clone(),
                             cwd: new_cwd,
                         },
                     );
@@ -1209,22 +1511,34 @@ pub fn spawn(
         );
 
         // Drop the master Arc ref by removing the session from the map.
-        {
-            let mut map = session_for_cleanup.lock().unwrap();
-            map.remove(&sid_cleanup);
-        }
-
-        let _ = app_out.emit(
-            "tier-terminal-status",
-            TerminalStatus {
-                id: session_id_out,
-                running: false,
-                exit_code: Some(0),
-            },
+        let was_current_run = remove_session_generation(
+            &session_for_cleanup,
+            &sid_cleanup,
+            &run_id_for_emitter,
         );
+
+        if was_current_run {
+            if let Ok(mut registry) = launch_registry_for_cleanup.lock() {
+                registry.finish(&session_id_out, &run_id_for_emitter);
+            }
+            let _ = app_out.emit(
+                "tier-terminal-status",
+                TerminalStatus {
+                    id: session_id_out.clone(),
+                    run_id: run_id_for_emitter.clone(),
+                    running: false,
+                    exit_code: Some(0),
+                },
+            );
+            crate::server::schedule_terminal_run_cleanup(
+                app_out,
+                session_id_out,
+                run_id_for_emitter,
+            );
+        }
     });
 
-    Ok(())
+    Ok(true)
 }
 
 // ─── Path resolution (Unix only) ─────────────────────────────────────────────
@@ -1251,6 +1565,140 @@ fn resolve_program(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_terminal_session(run_id: &str) -> TerminalSession {
+        let (kill_tx, _kill_rx) = std::sync::mpsc::channel();
+        TerminalSession {
+            run_id: run_id.to_string(),
+            run_lifecycle_lock: Arc::new(Mutex::new(())),
+            run_is_live: Arc::new(AtomicBool::new(true)),
+            writer_lock: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+            kill_tx,
+            tool_name: None,
+            session_token: Mutex::new(None),
+            _master: Arc::new(Mutex::new(None)),
+            activity: Arc::new(Mutex::new(SessionActivity {
+                last_output_at: Instant::now(),
+                last_status: "wait_input".to_string(),
+                native_status: None,
+            })),
+            is_tab_active: Arc::new(AtomicBool::new(false)),
+            output_buffer: Arc::new(Mutex::new(TerminalOutputBuffer::new())),
+        }
+    }
+
+    #[test]
+    fn install_session_generation_retires_only_the_replaced_run() {
+        let sessions: SharedSession = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let launches: SharedLaunchRegistry = Arc::new(Mutex::new(TerminalLaunchRegistry::default()));
+        let previous = test_terminal_session("run-old");
+        let previous_is_live = previous.run_is_live.clone();
+        sessions
+            .lock()
+            .unwrap()
+            .insert("tab-A::pane-1".to_string(), previous);
+        assert!(launches
+            .lock()
+            .unwrap()
+            .reserve("tab-A::pane-1", "run-new"));
+
+        let replaced = install_session_generation(
+            &sessions,
+            &launches,
+            "tab-A::pane-1",
+            "run-new",
+            test_terminal_session("run-new"),
+        )
+        .unwrap();
+        let SessionInstallOutcome::Installed(replaced) = replaced else {
+            panic!("current launch must install");
+        };
+        let replaced = replaced.unwrap();
+
+        assert_eq!(replaced.run_id, "run-old");
+        assert!(!previous_is_live.load(Ordering::Acquire));
+        let current = sessions.lock().unwrap();
+        let current = current.get("tab-A::pane-1").unwrap();
+        assert_eq!(current.run_id, "run-new");
+        assert!(current.run_is_live.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn deactivate_and_remove_are_bound_to_the_exact_run() {
+        let sessions: SharedSession = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let session = test_terminal_session("run-live");
+        let is_live = session.run_is_live.clone();
+        sessions
+            .lock()
+            .unwrap()
+            .insert("tab-A::pane-2".to_string(), session);
+
+        assert!(!deactivate_session_generation(
+            &sessions,
+            "tab-A::pane-2",
+            "run-old"
+        ));
+        assert!(is_live.load(Ordering::Acquire));
+        assert!(deactivate_session_generation(
+            &sessions,
+            "tab-A::pane-2",
+            "run-live"
+        ));
+        assert!(!is_live.load(Ordering::Acquire));
+        assert!(!remove_session_generation(
+            &sessions,
+            "tab-A::pane-2",
+            "run-old"
+        ));
+        assert!(remove_session_generation(
+            &sessions,
+            "tab-A::pane-2",
+            "run-live"
+        ));
+        assert!(!sessions.lock().unwrap().contains_key("tab-A::pane-2"));
+    }
+
+    #[test]
+    fn launch_registry_consumes_a_kill_that_arrives_before_start() {
+        let mut registry = TerminalLaunchRegistry::default();
+        registry.cancel("tab-A::pane-1", "run-a");
+        assert!(!registry.reserve("tab-A::pane-1", "run-a"));
+        assert!(registry.reserve("tab-A::pane-1", "run-b"));
+        assert!(registry.is_current("tab-A::pane-1", "run-b"));
+    }
+
+    #[test]
+    fn launch_registry_old_finish_cannot_clear_replacement() {
+        let mut registry = TerminalLaunchRegistry::default();
+        assert!(registry.reserve("tab-A::pane-1", "run-a"));
+        assert!(registry.reserve("tab-A::pane-1", "run-b"));
+        registry.finish("tab-A::pane-1", "run-a");
+        assert!(registry.is_current("tab-A::pane-1", "run-b"));
+        registry.finish("tab-A::pane-1", "run-b");
+        assert!(!registry.is_current("tab-A::pane-1", "run-b"));
+    }
+
+    #[test]
+    fn old_cancel_cannot_cancel_a_replacement_run() {
+        let mut registry = TerminalLaunchRegistry::default();
+        assert!(registry.reserve("tab-A::pane-1", "run-a"));
+        assert!(registry.reserve("tab-A::pane-1", "run-b"));
+
+        // A delayed cleanup from the old component must leave the new pane
+        // active. Its tombstone only rejects an equally delayed old start.
+        registry.cancel("tab-A::pane-1", "run-a");
+        assert!(registry.is_current("tab-A::pane-1", "run-b"));
+        assert!(!registry.reserve("tab-A::pane-1", "run-a"));
+        assert!(registry.is_current("tab-A::pane-1", "run-b"));
+    }
+
+    #[test]
+    fn duplicate_start_cannot_replace_its_own_live_run() {
+        let mut registry = TerminalLaunchRegistry::default();
+        assert!(registry.reserve("tab-A::pane-1", "run-a"));
+        assert!(!registry.reserve("tab-A::pane-1", "run-a"));
+        assert!(registry.is_current("tab-A::pane-1", "run-a"));
+    }
 
     // ── extract_osc7_cwd ──────────────────────────────────────────────────────
 

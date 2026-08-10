@@ -22,6 +22,7 @@ import { useT } from '../../i18n/useT';
 interface Props {
   toolKey: string;
   toolLabel: string;
+  onSaved?: () => void;
   onClose: () => void;
 }
 
@@ -94,7 +95,7 @@ function diffField<T extends string | string[]>(value: T, defaultValue: T): T {
   return value === defaultValue ? ('' as unknown as T) : value;
 }
 
-export function ToolConfigModal({ toolKey, toolLabel, onClose }: Props) {
+export function ToolConfigModal({ toolKey, toolLabel, onSaved, onClose }: Props) {
   const t = useT();
   const def = useMemo(() => defaultsFor(toolKey), [toolKey]);
   const [entry, setEntry] = useState<ToolConfigEntry>(def);
@@ -131,6 +132,7 @@ export function ToolConfigModal({ toolKey, toolLabel, onClose }: Props) {
         history_path: diffField(entry.history_path.trim(), def.history_path),
       };
       await commands.setToolConfig(toolKey, payload);
+      onSaved?.();
       onClose();
     } finally {
       setSaving(false);
@@ -141,6 +143,7 @@ export function ToolConfigModal({ toolKey, toolLabel, onClose }: Props) {
     setSaving(true);
     try {
       await commands.setToolConfig(toolKey, EMPTY);
+      onSaved?.();
       setEntry(def);
       setExtraArgsText(def.extra_args.join('\n'));
     } finally {

@@ -1,16 +1,21 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { focusTerminal } from '../../lib/focus-registry';
 import { onWindowForeground } from '../../lib/window-focus-filter';
 import { TierTerminal } from './TierTerminal';
 import { FourSplitGrid } from './FourSplitGrid';
 import { MultiAgentGrid } from './MultiAgentGrid';
+import { MultiAgentWorkspaceRecovery } from './MultiAgentWorkspaceRecovery';
 import { ToolConfigModal } from './ToolConfigModal';
 import { ContributionHeatmap } from './ContributionHeatmap';
+import { getMcpLaunchWrapperWarning, McpLaunchWrapperWarning } from '../../features/mcp/McpLaunchWrapperWarning';
 import { ErrorBoundary } from '../common/ErrorBoundary';
 import { DiffPanel } from '../right/DiffPanel';
 import { supportsNativeAgentStatus, useAppState, type ToolType } from '../../store/app-state';
 import { isFrostShape } from '../../lib/personalization';
+
+const matchesCoffeeMcpAgent = (tool: ToolType): tool is 'claude' | 'codex' | 'opencode' =>
+  tool === 'claude' || tool === 'codex' || tool === 'opencode';
 
 // Dropdown shown when a tool card's folder icon is clicked: the globally
 // recent project folders (any tool that used one) + "Open folder…" last.
@@ -106,7 +111,7 @@ interface RemoteHistoryItem {
   port: string;
   user: string;
 }
-import { isTauri, commands } from '../../tauri';
+import { isTauri, commands, type BeginWorkspaceRestoreResult, type McpConfig, type McpProfileSelection, type RestorePaneStatus, type ToolConfigEntry, type WorkspaceSummary } from '../../tauri';
 import { getToolDisplayName } from '../../lib/tool-info';
 import { useT } from '../../i18n/useT';
 import './CenterPanel.css';
@@ -721,6 +726,10 @@ export function CenterPanel() {
   };
   const [connStatus, setConnStatus] = useState<'idle' | 'connecting' | 'failed'>('idle');
   const [lastCwdByTool, setLastCwdByTool] = useState<Record<string, string>>({});
+  const [mcpConfig, setMcpConfig] = useState<McpConfig | null>(null);
+  const [mcpConfigUnavailable, setMcpConfigUnavailable] = useState(false);
+  const [launchMcpSelection, setLaunchMcpSelection] = useState<McpProfileSelection>({ mode: 'auto' });
+  const [toolConfigs, setToolConfigs] = useState<Record<string, ToolConfigEntry>>({});
   // Global recent project folders (across all folder-using tools) — backs the
   // folder-icon dropdown. Separate from the per-tool last-cwd above.
   const [recentFolders, setRecentFolders] = useState<string[]>(() => {
@@ -760,7 +769,7 @@ export function CenterPanel() {
         // helper, and stealing the focus always landed on the wrong one.
         // The enforcer now only pulls focus back when it wanders to
         // genuinely non-input DOM (<div>, <body>, a clicked tab bar).
-        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT')) {
           return;
         }
         const id = activeIdRef.current;
@@ -801,6 +810,27 @@ export function CenterPanel() {
   // can't see the latest value otherwise) can skip work while in a terminal tab.
   const isLaunchpadModeRef = useRef(isLaunchpadMode);
   useEffect(() => { isLaunchpadModeRef.current = isLaunchpadMode; }, [isLaunchpadMode]);
+
+  useEffect(() => {
+    if (!isTauri || !isLaunchpadMode || state.settingsOpen) return;
+    commands.getMcpConfig()
+      .then(config => {
+        setMcpConfig(config);
+        setMcpConfigUnavailable(false);
+      })
+      .catch(() => {
+        setMcpConfig(null);
+        setMcpConfigUnavailable(true);
+      });
+    commands.getAllToolConfigs()
+      .then(setToolConfigs)
+      .catch(() => setToolConfigs({}));
+  }, [isLaunchpadMode, state.settingsOpen]);
+
+  const refreshToolConfigs = () => {
+    if (!isTauri) return;
+    commands.getAllToolConfigs().then(setToolConfigs).catch(() => {});
+  };
 
 
 
@@ -944,8 +974,98 @@ export function CenterPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const handleWorkspaceRestore = useCallback((
+    result: BeginWorkspaceRestoreResult,
+    snapshot: WorkspaceSummary,
+  ) => {
+    const { plan } = result;
+    const layoutTool: ToolType = plan.pane_count === 2
+      ? 'two-agent'
+      : plan.pane_count === 3
+        ? 'three-agent'
+        : plan.pane_count === 4
+          ? 'multi-agent'
+          : null;
+    const toPaneTool = (value: string | null): 'claude' | 'codex' | 'opencode' | null =>
+      value === 'claude' || value === 'codex' || value === 'opencode' ? value : null;
+    const toRestoreIssue = (status: RestorePaneStatus) => (
+      status === 'needs_binding'
+      || status === 'cwd_missing'
+      || status === 'tool_missing'
+      || status === 'mcp_unavailable'
+      || status === 'token_invalid'
+    ) ? status : undefined;
+    const invalidPlan = !layoutTool
+      || plan.snapshot_id !== snapshot.snapshot_id
+      || plan.panes.length !== plan.pane_count
+      || plan.panes.some((pane) => {
+        const launches = pane.status === 'resumable' || pane.status === 'fresh';
+        return (launches || pane.status === 'skipped') && toPaneTool(pane.tool) === null;
+      });
+    if (invalidPlan) {
+      // This should only be reachable for a malformed backend response. The
+      // lease has no claimed pane yet, so releasing it leaves no orphan state.
+      commands.releaseMultiAgentWorkspaceRestore(result.attempt_id).catch(() => {});
+      console.warn('[multi-agent] rejected malformed workspace restore plan');
+      return;
+    }
+
+    const panes = plan.panes.map((pane) => {
+      const tool = toPaneTool(pane.tool);
+      const launches = pane.status === 'resumable' || pane.status === 'fresh';
+      const skipped = pane.status === 'skipped';
+      const restoreIssue = toRestoreIssue(pane.status);
+      return {
+        paneIdx: pane.pane_index,
+        tool: launches ? tool : null,
+        sentinelEnabled: pane.sentinel_enabled,
+        mcpSelection: pane.mcp_selection,
+        ...(launches ? { restoreLeasePending: true } : {}),
+        ...(pane.status === 'fresh' ? { workspaceContinuation: 'fresh_by_user' as const } : {}),
+        ...(skipped && tool ? {
+          workspaceContinuation: 'skipped' as const,
+          restoreTool: tool,
+        } : {}),
+        ...(restoreIssue && tool ? {
+          restoreTool: tool,
+          restoreStatus: restoreIssue,
+          restoreReason: pane.reason ?? undefined,
+          // Selecting this pane later is an explicit choice to create a fresh
+          // conversation. It must never consume a stale resume lease.
+          startFreshOnSelect: true,
+        } : {}),
+      };
+    });
+    const id = crypto.randomUUID();
+    dispatch({
+      type: 'ADD_TERMINAL',
+      session: {
+        id,
+        tool: layoutTool,
+        folderPath: plan.workspace,
+        multiAgent: { panes },
+        multiAgentWorkspaceId: snapshot.snapshot_id,
+        multiAgentWorkspaceCheckpointVersion: plan.checkpoint_version,
+        multiAgentRestoreAttemptId: result.attempt_id,
+        multiAgentWorkspacePersisted: true,
+      },
+    });
+    setShowLibrary(false);
+  }, [dispatch]);
+
   const handleCloseTab = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
+    const restoreAttemptId = terminals.find((tab) => tab.id === id)?.multiAgentRestoreAttemptId;
+    if (restoreAttemptId) {
+      // Revoke any not-yet-mounted panes immediately. Already running panes
+      // retain their binding until their normal unmount cleanup has stopped
+      // the PTY, at which point the backend releases the settled attempt.
+      commands.releaseMultiAgentWorkspaceRestore(restoreAttemptId).catch(() => {});
+    }
+    // Closing a tab stops its PTYs through TierTerminal's unmount cleanup, but
+    // keeps the compact workspace snapshot. The recovery panel owns deletion
+    // through its explicit two-step discard action, so a failed restore can be
+    // closed and retried without losing its multi-pane conversation map.
     dispatch({ type: 'REMOVE_TERMINAL', id });
   };
 
@@ -1118,7 +1238,8 @@ export function CenterPanel() {
         });
         pushRecentFolder(cwd);
       }
-      dispatch({ type: 'SET_TERMINAL_TOOL', id: activeTerminalId, tool, toolData });
+      const mcpSelection = matchesCoffeeMcpAgent(tool) ? launchMcpSelection : { mode: 'auto' as const };
+      dispatch({ type: 'SET_TERMINAL_TOOL', id: activeTerminalId, tool, toolData, mcpSelection });
     }
   };
 
@@ -1500,6 +1621,7 @@ export function CenterPanel() {
                   toolData={t.toolData}
                   folderPath={t.folderPath}
                   resumeToken={t.resumeToken}
+                  mcpSelection={t.mcpSelection}
                   hasBg={hasBg}
                   bgUrl={bgUrl}
                   bgType={bgType}
@@ -1547,6 +1669,7 @@ export function CenterPanel() {
                 {/* ─── Page 1: Desktop (pinned items) ─── */}
                 <div className="launchpad-page">
                   <div className="launchpad-inner">
+                    <MultiAgentWorkspaceRecovery onRestore={handleWorkspaceRestore} />
                     {(() => {
                       const pinnedAgents = AGENT_CATALOG.filter(a => pinnedItems.includes(`agent:${a.key}`));
 
@@ -1568,6 +1691,9 @@ export function CenterPanel() {
                             const isTerminal = tool.key === 'terminal';
                             const installed = isTerminal || toolsInstalled[tool.key ?? ''] !== false;
                             const disabled = !installed;
+                            const wrapperWarning = matchesCoffeeMcpAgent(tool.key)
+                              ? getMcpLaunchWrapperWarning(launchMcpSelection, mcpConfig, tool.key, toolConfigs, { toolLabel: tool.label })
+                              : null;
                             return (
                               <div key={`agent-${tool.key}`} className={`launchpad-card-group ${disabled ? 'launchpad-card-disabled' : ''}`}>
                                 <div
@@ -1615,6 +1741,7 @@ export function CenterPanel() {
                                         {formatCwd(lastCwdByTool[tool.key!])}
                                       </span>
                                     )}
+                                    <McpLaunchWrapperWarning warning={wrapperWarning} className="mcp-launch-wrapper-warning--card" />
                                   </div>
                                   {tool.requiresCwd && (
                                     <div className="launchpad-folder-btn" onClick={(e) => {
@@ -1918,6 +2045,28 @@ export function CenterPanel() {
               className={`launchpad-chrome launchpad-chrome--desktop ${showLibrary ? '' : 'is-visible'}`}
               aria-hidden={showLibrary}
             >
+              {(mcpConfigUnavailable || (mcpConfig && Object.keys(mcpConfig.profiles).length > 0)) && (
+                <label className="launchpad-mcp-select" title="MCP profile">
+                  <span>MCP</span>
+                  <select
+                    value={launchMcpSelection.mode === 'profile' ? `profile:${launchMcpSelection.profile_id}` : launchMcpSelection.mode}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setLaunchMcpSelection(value === 'auto'
+                        ? { mode: 'auto' }
+                        : value === 'none'
+                          ? { mode: 'none' }
+                          : { mode: 'profile', profile_id: value.slice('profile:'.length) });
+                    }}
+                  >
+                    <option value="auto">Auto</option>
+                    <option value="none">None</option>
+                    {Object.entries(mcpConfig?.profiles ?? {}).map(([id, profile]) => (
+                      <option key={id} value={`profile:${id}`}>{profile.name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <button
                 className="mode-switch-btn"
                 onClick={() => setShowLibrary(true)}
@@ -1974,6 +2123,7 @@ export function CenterPanel() {
         <ToolConfigModal
           toolKey={configModalTool.key}
           toolLabel={configModalTool.label}
+          onSaved={refreshToolConfigs}
           onClose={() => setConfigModalTool(null)}
         />
       )}
