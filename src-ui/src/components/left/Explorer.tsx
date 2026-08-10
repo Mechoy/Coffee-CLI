@@ -11,6 +11,12 @@ import { clipboardWrite } from '../../lib/clipboard';
 import { beginExplorerDrag } from '../../lib/explorer-drag';
 import { useFileStats, useDirtyDirs } from '../../lib/git-status';
 import { refreshHistory } from '../../lib/history-cache';
+import {
+  DISTRIBUTION_LABEL,
+  DISTRIBUTION_RELEASES_URL,
+  DISTRIBUTION_VERSION_MANIFEST_URL,
+  isNewerDistributionVersion,
+} from '../../lib/distribution';
 import { commands, onSelfUpdateProgress } from '../../tauri';
 import type { DirEntryInfo } from '../../tauri';
 import { HistoryBoard } from '../right/HistoryBoard';
@@ -591,6 +597,7 @@ export function Explorer() {
 
   // Update check
   const [hasUpdate, setHasUpdate] = useState(false);
+  const [availableUpdateVersion, setAvailableUpdateVersion] = useState<string | null>(null);
   // The brand (logo + title + the self-update button) renders here but DISPLAYS
   // in the titlebar's left slot via portal — so it keeps all its Explorer-local
   // self-update state untouched, and hides together with the left panel (this
@@ -602,20 +609,17 @@ export function Explorer() {
     const checkUpdate = async () => {
       try {
         const { getVersion } = await import('@tauri-apps/api/app');
-        const [local, remote] = await Promise.all([
+        const [local, response] = await Promise.all([
           getVersion(),
-          fetch('https://coffeecli.com/version.json').then(r => r.json()),
+          fetch(DISTRIBUTION_VERSION_MANIFEST_URL, { cache: 'no-store' }),
         ]);
-        const isNewer = (r: string, l: string) => {
-          const rv = r.split('.').map(Number);
-          const lv = l.split('.').map(Number);
-          for (let i = 0; i < 3; i++) {
-            if ((rv[i] ?? 0) > (lv[i] ?? 0)) return true;
-            if ((rv[i] ?? 0) < (lv[i] ?? 0)) return false;
-          }
-          return false;
-        };
-        if (remote?.version && isNewer(remote.version, local)) setHasUpdate(true);
+        if (!response.ok) return;
+        const release = await response.json() as { version?: unknown };
+        const remoteVersion = typeof release.version === 'string' ? release.version : null;
+        if (remoteVersion && isNewerDistributionVersion(remoteVersion, local)) {
+          setAvailableUpdateVersion(remoteVersion);
+          setHasUpdate(true);
+        }
       } catch { /* offline or fetch failed — silent */ }
     };
     checkUpdate();
@@ -632,7 +636,11 @@ export function Explorer() {
   const handleSelfUpdate = useCallback(async () => {
     if (installing) return;
     if (!navigator.userAgent.toLowerCase().includes('win')) {
-      commands.openUrl('https://coffeecli.com');
+      commands.openUrl(DISTRIBUTION_RELEASES_URL);
+      return;
+    }
+    if (!availableUpdateVersion) {
+      commands.openUrl(DISTRIBUTION_RELEASES_URL);
       return;
     }
     setInstalling(true);
@@ -644,18 +652,18 @@ export function Explorer() {
         setInstallPhase(p.status);
         setInstallPct(p.percent);
       });
-      await commands.downloadAndInstallUpdate();
+      await commands.downloadAndInstallUpdate(availableUpdateVersion);
       // Success: installer launched and the app is about to exit — leave the
       // ring as-is until the window goes away.
     } catch {
-      commands.openUrl('https://coffeecli.com');
+      commands.openUrl(DISTRIBUTION_RELEASES_URL);
       setInstalling(false);
       setInstallPhase(null);
       setInstallPct(0);
     } finally {
       unlisten?.();
     }
-  }, [installing]);
+  }, [availableUpdateVersion, installing]);
 
   // Persist last-selected left tab, same pattern as TaskBoard's right tab.
   const [activeTab, setActiveTab] = useState<'workspace' | 'history'>(() => {
@@ -801,7 +809,7 @@ export function Explorer() {
               className={`icon-btn xs update-check-btn update-available${installing ? ' is-installing' : ''}`}
               onClick={handleSelfUpdate}
               disabled={installing}
-              aria-label="Update Coffee CLI"
+              aria-label={`Update ${DISTRIBUTION_LABEL}`}
             >
               {installing ? (
                 <svg

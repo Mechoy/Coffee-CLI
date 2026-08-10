@@ -19,6 +19,7 @@ import { useT } from '../../i18n/useT';
 import { IS_MACOS, IS_WINDOWS } from '../../lib/platform';
 import { TERM_COLOR_SCHEMES } from '../center/TierTerminal';
 import { commands, type FontInfo } from '../../tauri';
+import { DISTRIBUTION_LABEL, DISTRIBUTION_REPOSITORY_URL } from '../../lib/distribution';
 import { FontPicker } from './FontPicker';
 import { McpSettings } from '../../features/mcp/McpSettings';
 import { THEME_COLORS, THEME_SHAPES, ICON_ART_THEMES, LANGUAGES, TASK_VIEW_MODES, isMaskTintTheme } from '../../lib/personalization';
@@ -289,13 +290,13 @@ export function SettingsModal() {
           ))}
           {version && (
             <div className="settings-rail-version">
-              <span className="settings-rail-version-num">v{version}</span>
+              <span className="settings-rail-version-num">v{version} · {DISTRIBUTION_LABEL}</span>
               <button
                 type="button"
                 className="settings-rail-version-link"
-                onClick={() => commands.openUrl('https://coffeecli.com').catch(() => {})}
+                onClick={() => commands.openUrl(DISTRIBUTION_REPOSITORY_URL).catch(() => {})}
               >
-                CoffeeCLI.com
+                Mechoy GitHub
               </button>
             </div>
           )}
@@ -677,7 +678,7 @@ export function SettingsModal() {
                   <button
                     type="button"
                     className="settings-feedback-card"
-                    onClick={() => commands.openUrl('https://github.com/edison7009/Coffee-CLI/issues').catch(() => {})}
+                    onClick={() => commands.openUrl(`${DISTRIBUTION_REPOSITORY_URL}/issues`).catch(() => {})}
                   >
                     <span className="settings-feedback-card-icon">
                       <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
@@ -687,16 +688,6 @@ export function SettingsModal() {
                     <span className="settings-feedback-card-label">GitHub</span>
                     <ExternalLinkArrow />
                   </button>
-                  {state.currentLang === 'zh-CN' && (
-                    <button
-                      type="button"
-                      className="settings-feedback-card"
-                      onClick={() => commands.openUrl('https://gitcode.com/edison7009/Coffee-CLI/issues').catch(() => {})}
-                    >
-                      <span className="settings-feedback-card-label">国内访问：GitCode</span>
-                      <ExternalLinkArrow />
-                    </button>
-                  )}
                 </div>
               </>
             )}

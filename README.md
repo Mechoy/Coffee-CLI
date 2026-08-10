@@ -25,7 +25,7 @@
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue" />
   <img src="https://img.shields.io/badge/languages-10-orange" />
   <img src="https://img.shields.io/badge/built%20with-Tauri%20%2B%20Rust-brown" />
-  <img src="https://img.shields.io/github/license/edison7009/Coffee-CLI" />
+  <img src="https://img.shields.io/github/license/Mechoy/Coffee-CLI" />
 </p>
 
 <p align="center">
@@ -144,7 +144,7 @@ restarted or hijacked.
 
 ```bash
 # macOS — call the binary directly (LaunchServices drops --args when the app is already running)
-"/Applications/Coffee CLI.app/Contents/MacOS/coffee-cli" launch --tool kimicode --cwd /work/project
+"/Applications/Coffee CLI Mechoy.app/Contents/MacOS/coffee-cli" launch --tool kimicode --cwd /work/project
 # Windows — pair with an Explorer right-click entry that passes the folder as %V
 coffee-cli.exe launch --tool claude --cwd "C:\work\project"
 # Linux
@@ -157,20 +157,21 @@ coffee-cli launch --tool codex --cwd ~/work/project
 
 **Windows**
 ```powershell
-irm https://raw.githubusercontent.com/edison7009/Coffee-CLI/main/install/install.ps1 | iex
+irm https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex
 ```
 
 **macOS** (Apple Silicon & Intel)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edison7009/Coffee-CLI/main/install/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh
 ```
 
 **Linux** (Debian / Ubuntu / AppImage)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edison7009/Coffee-CLI/main/install/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh
 ```
 
-Or download directly from [Releases](https://github.com/edison7009/Coffee-CLI/releases).
+This fork publishes `Mechoy Build` releases. Download them directly from
+[Releases](https://github.com/Mechoy/Coffee-CLI/releases).
 
 | Platform | Installer |
 |---|---|
@@ -183,7 +184,7 @@ Or download directly from [Releases](https://github.com/edison7009/Coffee-CLI/re
 
 ```bash
 # Prerequisites: Rust, Node.js
-git clone https://github.com/edison7009/Coffee-CLI
+git clone https://github.com/Mechoy/Coffee-CLI
 cd Coffee-CLI
 cd src-ui && npm install && cd ..
 cargo tauri build
@@ -222,7 +223,7 @@ Coffee CLI 同时消除两道门槛：**不需要终端经验，不需要懂英�
 
 ```bash
 # macOS —— 建议直接调用二进制（应用已运行时，open -a 的 --args 会被系统丢弃）
-"/Applications/Coffee CLI.app/Contents/MacOS/coffee-cli" launch --tool kimicode --cwd /work/project
+"/Applications/Coffee CLI Mechoy.app/Contents/MacOS/coffee-cli" launch --tool kimicode --cwd /work/project
 # Windows —— 配合资源管理器右键菜单，用 %V 传入当前文件夹
 coffee-cli.exe launch --tool claude --cwd "C:\work\project"
 # Linux
@@ -233,15 +234,15 @@ coffee-cli launch --tool codex --cwd ~/work/project
 
 **Windows**
 ```powershell
-irm https://raw.githubusercontent.com/edison7009/Coffee-CLI/main/install/install.ps1 | iex
+irm https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex
 ```
 
 **macOS / Linux**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edison7009/Coffee-CLI/main/install/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh
 ```
 
-也可以直接从 [Releases](https://github.com/edison7009/Coffee-CLI/releases) 下载对应平台的安装包。
+这是 Mechoy Build；也可以直接从 [Releases](https://github.com/Mechoy/Coffee-CLI/releases) 下载对应平台的安装包。
 
 ---
 

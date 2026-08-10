@@ -1,63 +1,55 @@
-# Coffee CLI - Windows Installer / Updater
-# Usage:   irm https://coffeecli.com/install.ps1 | iex
-# License: AGPL-3.0-or-later (https://github.com/edison7009/Coffee-CLI/blob/main/LICENSE)
+# Coffee CLI Mechoy Build - Windows Installer / Updater
+# Usage:   irm https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex
+# License: AGPL-3.0-or-later (https://github.com/Mechoy/Coffee-CLI/blob/main/LICENSE)
 
 $ErrorActionPreference = "Stop"
+$productName = "Coffee CLI Mechoy"
+$legacyProductName = "Coffee CLI"
 
 Write-Host ""
-Write-Host "  Coffee CLI Installer" -ForegroundColor Cyan
+Write-Host "  $productName Installer" -ForegroundColor Cyan
 Write-Host "  --------------------" -ForegroundColor DarkGray
 
-# Resolve version and binary via coffeecli.com (CF-hosted, China-accessible).
-# /version.json?platform=windows returns the latest release tag ONLY when
-# the Windows installer has been uploaded to GitHub Releases. If CI is
-# still mid-build, the endpoint returns an empty version, which we treat
-# as "no upgrade available yet" — preventing the earlier race where the
-# version bumped instantly but the .exe took another 15 min to appear.
-# /download/windows is a CF Worker route that proxies the matching GitHub
-# Release asset. This keeps the install path off api.github.com so the
-# script doesn't stall on a blocked or slow GitHub API from mainland
-# networks.
+# Mechoy builds read a marker that CI updates only after the matching release
+# is published. This avoids GitHub Releases API rate limits and prevents an
+# official Coffee CLI package from replacing local functionality.
 Write-Host "  Fetching latest version..." -ForegroundColor Gray
-# Try coffeecli.com first (CF-cached, China-accessible). If the Worker
-# is down or rate-limited on its shared GitHub API quota, fall back to
-# api.github.com directly — the user's own IP has its own anonymous
-# quota and won't share that pool, so this is meaningfully more
-# reliable for the single-user case.
 $latestVer = $null
 $fallbackUrl = $null
 try {
-    $latestVer = (Invoke-RestMethod "https://coffeecli.com/version.json?platform=windows" -TimeoutSec 10).version
-} catch {
-    Write-Host "  Trying GitHub directly..." -ForegroundColor Gray
-}
-if (-not $latestVer) {
-    try {
-        $release = Invoke-RestMethod "https://api.github.com/repos/edison7009/Coffee-CLI/releases/latest" `
-            -Headers @{ "User-Agent" = "CoffeeCLI-Install" } -TimeoutSec 15
-        # Match the Windows asset matcher in Web-Home/_worker.js — keep in sync.
-        $winAsset = $release.assets | Where-Object { $_.name -like "*x64-setup.exe" } | Select-Object -First 1
-        if ($winAsset) {
-            $latestVer = $release.tag_name -replace '^v',''
-            $fallbackUrl = $winAsset.browser_download_url
-        }
-    } catch {}
-}
+    $marker = Invoke-RestMethod "https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/Web-Home/mechoy-version.json" `
+        -Headers @{ "User-Agent" = "CoffeeCLI-Mechoy-Install" } -TimeoutSec 15
+    if ($marker.version -match '^(?<version>\d+\.\d+\.\d+)$') {
+        $latestVer = $Matches.version
+        $expectedAsset = "Coffee.CLI_Mechoy_${latestVer}_Windows_x64-setup.exe"
+        $fallbackUrl = "https://github.com/Mechoy/Coffee-CLI/releases/download/mechoy-v${latestVer}/${expectedAsset}"
+    }
+} catch {}
 
 # Detect currently installed version from Windows registry
 $installedVer = $null
+$legacyInstalledVer = $null
 $regPaths = @(
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
     "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
     "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
 )
 foreach ($path in $regPaths) {
-    $entry = Get-ItemProperty $path -ErrorAction SilentlyContinue |
-             Where-Object { $_.DisplayName -like "Coffee CLI*" } |
+    $entries = @(Get-ItemProperty $path -ErrorAction SilentlyContinue)
+    $entry = $entries |
+             Where-Object { $_.DisplayName -eq $productName } |
              Select-Object -First 1
     if ($entry) {
         $installedVer = $entry.DisplayVersion
         break
+    }
+    if (-not $legacyInstalledVer) {
+        $legacyEntry = $entries |
+                       Where-Object { $_.DisplayName -eq $legacyProductName } |
+                       Select-Object -First 1
+        if ($legacyEntry) {
+            $legacyInstalledVer = $legacyEntry.DisplayVersion
+        }
     }
 }
 
@@ -68,9 +60,8 @@ foreach ($path in $regPaths) {
 # the moment the script returns).
 if (-not $latestVer) {
     Write-Host ""
-    Write-Host "  A new version of Coffee CLI was just released." -ForegroundColor Yellow
-    Write-Host "  The server is currently redeploying." -ForegroundColor Yellow
-    Write-Host "  Please try again in about 10 minutes." -ForegroundColor Yellow
+    Write-Host "  No matching Mechoy Build installer is available yet." -ForegroundColor Yellow
+    Write-Host "  Check the release status and try again in about 10 minutes." -ForegroundColor Yellow
     Write-Host ""
     if ($installedVer) {
         Write-Host "  Your current v$installedVer stays installed." -ForegroundColor Gray
@@ -88,19 +79,28 @@ Write-Host "  Latest : v$latestVer" -ForegroundColor Green
 
 if ($installedVer) {
     Write-Host "  Installed: v$installedVer" -ForegroundColor Gray
-    if ($installedVer -eq $latestVer) {
+    $comparison = $null
+    try { $comparison = ([version]$installedVer).CompareTo([version]$latestVer) } catch {}
+    if ($null -ne $comparison -and $comparison -ge 0) {
         Write-Host ""
-        Write-Host "  Coffee CLI is already up to date (v$installedVer)." -ForegroundColor Green
+        if ($comparison -eq 0) {
+            Write-Host "  $productName is already up to date (v$installedVer)." -ForegroundColor Green
+        } else {
+            Write-Host "  A newer $productName build is already installed (v$installedVer)." -ForegroundColor Green
+        }
         Write-Host ""
         exit 0
     }
-    Write-Host "  Upgrading v$installedVer -> v$latestVer ..." -ForegroundColor Yellow
+    Write-Host "  Upgrading $productName v$installedVer -> v$latestVer ..." -ForegroundColor Yellow
 } else {
+    if ($legacyInstalledVer) {
+        Write-Host "  Legacy $legacyProductName v$legacyInstalledVer will be left unchanged." -ForegroundColor Yellow
+    }
     Write-Host "  Not installed - performing fresh install..." -ForegroundColor Gray
 }
 
-$url = if ($fallbackUrl) { $fallbackUrl } else { "https://coffeecli.com/download/windows" }
-$out = "$env:TEMP\coffee-cli-setup.exe"
+$url = $fallbackUrl
+$out = "$env:TEMP\coffee-cli-mechoy-setup.exe"
 
 Write-Host "  Downloading..." -ForegroundColor Gray
 # Wrap in try/catch so a transient 404 (CI edge case: version.json says
@@ -121,6 +121,6 @@ Write-Host "  Installing..." -ForegroundColor Gray
 Start-Process $out -Wait
 
 Write-Host ""
-Write-Host "  Done! Coffee CLI v$latestVer installed." -ForegroundColor Green
+Write-Host "  Done! $productName v$latestVer installed." -ForegroundColor Green
 Write-Host "  Launch it from the Start Menu." -ForegroundColor Gray
 Write-Host ""

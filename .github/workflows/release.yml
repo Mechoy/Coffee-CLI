@@ -3,7 +3,9 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      # Fork releases use an isolated namespace so fetching upstream tags can
+      # never collide with a locally customized build of the same x.y.z.
+      - 'mechoy-v*'
   workflow_dispatch:
 
 permissions:
@@ -23,6 +25,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -48,6 +52,26 @@ jobs:
         run: |
           cd src-ui
           npm run build
+
+      - name: Verify Mechoy release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "$TAG" = "$GITHUB_REF" ]; then
+            TAG="$(git describe --tags --match 'mechoy-v*' --abbrev=0)"
+          fi
+          if [[ ! "$TAG" =~ ^mechoy-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::Expected a tag like mechoy-v3.3.6, got: $TAG"
+            exit 1
+          fi
+          EXPECTED_VERSION="${BASH_REMATCH[1]}"
+          CARGO_VERSION="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -1)"
+          TAURI_VERSION="$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('tauri.conf.json', 'utf8')).version)")"
+          if [ "$CARGO_VERSION" != "$EXPECTED_VERSION" ] || [ "$TAURI_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "::error::Tag $TAG requires Cargo.toml and tauri.conf.json to both be $EXPECTED_VERSION (got $CARGO_VERSION / $TAURI_VERSION)"
+            exit 1
+          fi
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -109,20 +133,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Resolve release tag
         id: tag
         shell: bash
         run: |
-          # Tag-pushes give refs/tags/v1.2.3; workflow_dispatch falls back to
-          # the latest tag in the working tree. Bare version (no leading "v")
-          # is what tauri stamps into bundle filenames; both forms are
-          # exposed for downstream steps.
+          # Tag-pushes give refs/tags/mechoy-v1.2.3; workflow_dispatch falls
+          # back to the latest customized tag in the working tree. The app
+          # itself keeps a plain x.y.z version so native package managers and
+          # version comparison continue to work.
           TAG="${GITHUB_REF#refs/tags/}"
           if [ "$TAG" = "$GITHUB_REF" ]; then
-            TAG=$(git describe --tags --abbrev=0)
+            TAG=$(git describe --tags --match 'mechoy-v*' --abbrev=0)
           fi
-          VERSION="${TAG#v}"
+          if [[ ! "$TAG" =~ ^mechoy-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::Expected a tag like mechoy-v3.3.6, got: $TAG"
+            exit 1
+          fi
+          VERSION="${BASH_REMATCH[1]}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -236,7 +266,7 @@ jobs:
       # don't tell the end user which OS they're for and use inconsistent
       # arch slugs (amd64/x86_64/x64 across formats, plus rpm's `-1` release
       # suffix). We rename to the EchoBird-style convention:
-      #   Coffee.CLI_<version>_<OS>_<arch>.<ext>
+      #   Coffee.CLI_Mechoy_<version>_<OS>_<arch>.<ext>
       # so a glance at the GitHub Releases page makes the OS/arch obvious
       # and the install scripts have a single uniform pattern to grep.
       - name: Stage and rename artifacts
@@ -257,22 +287,22 @@ jobs:
             local out=""
             case "$base" in
               # Windows
-              *_x64-setup.exe)        out="Coffee.CLI_${VERSION}_Windows_x64-setup.exe" ;;
-              *_x64_*.msi|*_x64.msi)  out="Coffee.CLI_${VERSION}_Windows_x64.msi" ;;
+              *_x64-setup.exe)        out="Coffee.CLI_Mechoy_${VERSION}_Windows_x64-setup.exe" ;;
+              *_x64_*.msi|*_x64.msi)  out="Coffee.CLI_Mechoy_${VERSION}_Windows_x64.msi" ;;
               # macOS — separate native DMGs for Apple Silicon and Intel.
               # Tauri's bundler uses `aarch64` / `x64` suffixes on the dmg
               # name (matching the target triple's first segment).
-              *_aarch64.dmg)          out="Coffee.CLI_${VERSION}_macOS_arm64.dmg" ;;
-              *_x64.dmg)              out="Coffee.CLI_${VERSION}_macOS_x64.dmg" ;;
+              *_aarch64.dmg)          out="Coffee.CLI_Mechoy_${VERSION}_macOS_arm64.dmg" ;;
+              *_x64.dmg)              out="Coffee.CLI_Mechoy_${VERSION}_macOS_x64.dmg" ;;
               # Linux .deb (Tauri uses Debian "amd64"/"arm64")
-              *_amd64.deb)            out="Coffee.CLI_${VERSION}_Linux_x64.deb" ;;
-              *_arm64.deb)            out="Coffee.CLI_${VERSION}_Linux_arm64.deb" ;;
+              *_amd64.deb)            out="Coffee.CLI_Mechoy_${VERSION}_Linux_x64.deb" ;;
+              *_arm64.deb)            out="Coffee.CLI_Mechoy_${VERSION}_Linux_arm64.deb" ;;
               # Linux .AppImage (upstream AppImage uses "amd64"/"aarch64")
-              *_amd64.AppImage)       out="Coffee.CLI_${VERSION}_Linux_x64.AppImage" ;;
-              *_aarch64.AppImage)     out="Coffee.CLI_${VERSION}_Linux_arm64.AppImage" ;;
+              *_amd64.AppImage)       out="Coffee.CLI_Mechoy_${VERSION}_Linux_x64.AppImage" ;;
+              *_aarch64.AppImage)     out="Coffee.CLI_Mechoy_${VERSION}_Linux_arm64.AppImage" ;;
               # Linux .rpm (uses dot-separated `<name>-<ver>-<release>.<arch>.rpm`)
-              *.x86_64.rpm)           out="Coffee.CLI_${VERSION}_Linux_x64.rpm" ;;
-              *.aarch64.rpm)          out="Coffee.CLI_${VERSION}_Linux_arm64.rpm" ;;
+              *.x86_64.rpm)           out="Coffee.CLI_Mechoy_${VERSION}_Linux_x64.rpm" ;;
+              *.aarch64.rpm)          out="Coffee.CLI_Mechoy_${VERSION}_Linux_arm64.rpm" ;;
               *) echo "  skip: $base"; return 0 ;;
             esac
             cp "$src" "$STAGING/$out"
@@ -329,22 +359,21 @@ jobs:
             # artifacts and edit the changelog before users see the new
             # version. Clicking "Publish release" in the GitHub UI fires the
             # release.published event consumed by
-            # .github/workflows/bump-version-json.yml, which bumps
-            # Web-Home/version.json on main → CF Pages redeploys → in-app
-            # update check picks up the new version. Until then, in-app
-            # users and install scripts still see the previous release.
+            # .github/workflows/bump-version-json.yml, which writes the
+            # Mechoy version marker on main. Until then, in-app users and
+            # install scripts still see the previous published release.
             NOTES_FILE="$GITHUB_WORKSPACE/install/release-notes-template.md"
             if [ -f "$NOTES_FILE" ]; then
               gh release create "$TAG" --repo "${{ github.repository }}" \
                 --draft \
-                --title "Coffee CLI $TAG" \
+                --title "Coffee CLI v${{ steps.tag.outputs.version }} (Mechoy Build)" \
                 --notes-file "$NOTES_FILE" \
                 || echo "Release already exists (created by sibling matrix job)"
             else
               gh release create "$TAG" --repo "${{ github.repository }}" \
                 --draft \
-                --title "Coffee CLI $TAG" \
-                --notes "Coffee CLI $TAG. See README for install instructions." \
+                --title "Coffee CLI v${{ steps.tag.outputs.version }} (Mechoy Build)" \
+                --notes "Coffee CLI v${{ steps.tag.outputs.version }} (Mechoy Build). See README for install instructions." \
                 || echo "Release already exists (created by sibling matrix job)"
             fi
           fi

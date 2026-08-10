@@ -4836,13 +4836,25 @@ fn open_url(url: String) -> Result<(), String> {
 
 // ─── In-app self-update ────────────────────────────────────────────────────
 //
-// Downloads the latest installer from `coffeecli.com/download/<os>` — a CF
-// Worker that proxies the matching GitHub Release asset (China-accessible,
-// stable name, no per-version URL to construct). Streams the body so the
-// frontend can paint a circular download-progress ring via the
-// `self-update-progress` event, then launches the installer and exits so it
-// can replace our running files. ureq is blocking + rustls, so the whole
-// thing runs on a spawn_blocking thread; `app.emit` works from any thread.
+// Mechoy builds must never download an upstream Coffee CLI installer: that
+// would silently remove local multi-agent and MCP work. The frontend reads a
+// release-published Mechoy version marker, then this command derives the exact
+// tag and asset path without relying on GitHub's rate-limited Releases API.
+
+const DISTRIBUTION_REPOSITORY: &str = "Mechoy/Coffee-CLI";
+const DISTRIBUTION_RELEASE_TAG_PREFIX: &str = "mechoy-v";
+const DISTRIBUTION_ASSET_PREFIX: &str = "Coffee.CLI_Mechoy_";
+
+#[cfg(target_os = "windows")]
+const DISTRIBUTION_UPDATE_ASSET_SUFFIX: &str = "Windows_x64-setup.exe";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const DISTRIBUTION_UPDATE_ASSET_SUFFIX: &str = "macOS_arm64.dmg";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const DISTRIBUTION_UPDATE_ASSET_SUFFIX: &str = "macOS_x64.dmg";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const DISTRIBUTION_UPDATE_ASSET_SUFFIX: &str = "Linux_arm64.AppImage";
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
+const DISTRIBUTION_UPDATE_ASSET_SUFFIX: &str = "Linux_x64.AppImage";
 
 #[derive(serde::Serialize, Clone)]
 struct SelfUpdateProgress {
@@ -4858,19 +4870,44 @@ fn emit_self_update(app: &tauri::AppHandle, status: &str, percent: u32) {
 }
 
 #[tauri::command]
-async fn download_and_install_update(app: tauri::AppHandle) -> Result<(), String> {
-    let os = if cfg!(target_os = "windows") {
-        "windows"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else {
-        "linux"
-    };
-    let url = format!("https://coffeecli.com/download/{os}");
+async fn download_and_install_update(version: String, app: tauri::AppHandle) -> Result<(), String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || run_self_update(&app2, &url))
+    tauri::async_runtime::spawn_blocking(move || {
+        let url = distribution_update_url_for_version(&version)?;
+        run_self_update(&app2, &url)
+    })
         .await
         .map_err(|e| format!("self-update task join failed: {e}"))?
+}
+
+fn is_distribution_version(version: &str) -> bool {
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        true
+    } else {
+        false
+    }
+}
+
+fn distribution_update_asset_name(version: &str) -> String {
+    format!(
+        "{DISTRIBUTION_ASSET_PREFIX}{version}_{DISTRIBUTION_UPDATE_ASSET_SUFFIX}"
+    )
+}
+
+fn distribution_update_url_for_version(version: &str) -> Result<String, String> {
+    if !is_distribution_version(version) {
+        return Err("Mechoy update version must be an x.y.z numeric version".to_string());
+    }
+    let asset_name = distribution_update_asset_name(version);
+    let tag = format!("{DISTRIBUTION_RELEASE_TAG_PREFIX}{version}");
+    Ok(format!(
+        "https://github.com/{DISTRIBUTION_REPOSITORY}/releases/download/{tag}/{asset_name}"
+    ))
 }
 
 fn run_self_update(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
@@ -5910,6 +5947,23 @@ mod resume_cwd_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distribution_update_url_uses_only_the_custom_tag_and_asset() {
+        let version = "3.3.6";
+        let asset_name = distribution_update_asset_name(version);
+        let url = format!(
+            "https://github.com/{DISTRIBUTION_REPOSITORY}/releases/download/mechoy-v{version}/{asset_name}"
+        );
+
+        assert_eq!(distribution_update_url_for_version(version).unwrap(), url);
+    }
+
+    #[test]
+    fn distribution_update_rejects_a_non_semver_marker_value() {
+        assert!(distribution_update_url_for_version("v3.3.6").is_err());
+        assert!(distribution_update_url_for_version("3.3.6-mechoy").is_err());
+    }
 
     #[test]
     fn resume_arguments_keep_codex_mcp_overrides() {

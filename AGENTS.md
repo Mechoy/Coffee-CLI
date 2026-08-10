@@ -18,8 +18,8 @@
    - 最后一个版本 commit 是 `chore(release): v<x.y.z>`
    - Commit message 英文，不含网站（Web-Home）相关内容
 4. **Tag + Push 触发 CI**：
-   - `git tag v<x.y.z>` 打在 release commit 上
-   - `git push origin main && git push origin v<x.y.z>`
+   - `git tag mechoy-v<x.y.z>` 打在 release commit 上
+   - `git push origin main && git push origin mechoy-v<x.y.z>`
    - Tag push 是 CI Release workflow 的唯一触发条件，仅 push commit 不会触发
 5. **验证 CI 权限** — 确保 workflow 配置里有 `permissions: contents: write`（踩过 GITHUB_TOKEN 只读的坑）
 
@@ -30,19 +30,27 @@
 - **禁止两位 patch**：`v2.5.9` 后下一个发 `v2.6.0`（不是 `v2.5.10`）。这是触发 minor bump 的**唯一**条件
 - 反例：v2.5.1 加了 Changes tab 新功能就发 v2.6.0 ❌ —— 应该发 v2.5.2 ✅。已踩过这个坑（2026-05-08）
 
-### version.json 已不再手动维护（v1.0.2+）
+### Mechoy 分发身份与版本
+
+- 应用内部版本保持纯 `x.y.z`，同步官方后本 fork 默认 patch+1；不要使用
+  `-mechoy`、`+mechoy` 或四段版本号。
+- 用户可见标识是 `Coffee CLI Mechoy` / `Mechoy Build`；macOS 应用、Windows
+  安装项和 Linux 包名都必须保持这个独立身份，避免同版本官方包互相覆盖。
+- 仅 `mechoy-v<x.y.z>` tag 触发本 fork 的 Release workflow。不要推送 `v*`
+  tag 作为本 fork 的发布标签，避免和 upstream tag 冲突。
+- 自定义安装器与应用内更新只使用 `Mechoy/Coffee-CLI` Releases；不要恢复
+  `coffeecli.com` 或 upstream 的下载地址。
+
+### version.json 不再手动维护
 
 旧的"第 6 步——改 `Web-Home/version.json` 为新版本号"已经**废弃并删除**。
 
 历史问题：静态 version.json 在 tag push 的瞬间就指向新版，但 CI 构建各平台安装包要 15-20 分钟；用户在这窗口内跑 `install.ps1`，脚本能读到 "Latest: v1.x.y" 但 `/download/windows` 返回 404——糟糕体验。
 
-新架构（`Web-Home/_worker.js` 的 `/version.json` 路由）：
-- CF Worker 查 GitHub API latest release
-- 支持 `?platform=windows|macos-arm|linux-deb|linux-appimage`
-- **只有该平台的安装包实际上传到 GitHub Releases 后，才返回新版号**；否则返回空字符串，install 脚本识别为"无升级"优雅退出
-- 两份 install 脚本（`install.ps1` + `install.sh`）都升级了容错：空版本 / 下载失败时打印"CI 还在编译，15 分钟后再试"，不抛 PowerShell/bash 异常栈
-
-结果：发版时**零手动 version.json 维护**，用户侧**零时间差**。
+Mechoy Build 不使用 `Web-Home/version.json` 或 GitHub Releases API 作为更新源。
+已发布 `mechoy-v*` Release 后，CI 自动写入 `Web-Home/mechoy-version.json`；
+安装器和应用据此构造精确资产地址。因此发布时**不要**手动修改任一版本标记，也
+不要将 fork 部署到上游 `coffeecli.com` 分发链路。
 
 ---
 
@@ -74,6 +82,8 @@ WebView2 对 `navigator.clipboard.*` 和 `document.execCommand('copy'|'paste')` 
 
 - **分支策略**：只用 `main`，master 已删。install 脚本硬编码 `raw.githubusercontent.com/.../main/...`
 - **安装脚本双位置**：`install/` 和 `Web-Home/` 各一份，改动必须同步两处（CF Worker 路由根据路径分发）
-- **CF Worker 路由**：`coffeecli.com/version.json` 打到 Web-Home 静态；`coffeecli.com/download/<platform>` 走 Worker 重定向到 GitHub Releases
+- **CF Worker 路由**：若部署本 fork 的 `Web-Home`，Worker 仅代理
+  `Mechoy/Coffee-CLI` 的 `mechoy-v*` Release 资产；上游 `coffeecli.com`
+  不是本 fork 的安装或更新入口
 - **PTY 锁死根因 #1 已修**（v0.6.1）：child watcher 线程；若复现视为根因 #2（emit/channel backpressure），看 `src/terminal.rs` reader 线程
 - **Hook forwarder 纪律**（v3.2.5+）：`__hook` 全路径 exit 0；`argv[1]` 以 `__` 开头但不认识的子命令也 exit 0（不起 GUI），防止"新配置 + 旧 exe"时 hook 报 exit 1。Claude hook 条目按 Git Bash 是否可探测写两种形态（`claude_hook_entry`）：有 Git Bash → `"shell": "bash"` + 引号命令；没有 → `"shell": "powershell"` + `& "..." __hook`——Windows 上 Claude 检测不到 Git Bash 会 fallback PowerShell，而 PowerShell 把引号开头的命令串当表达式直接 ParserError exit 1。排查 hook 问题用 `COFFEE_HOOK_DEBUG=1`，日志在 `~/.coffee-cli/hooks/hook-debug.log`

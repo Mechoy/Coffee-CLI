@@ -57,7 +57,7 @@ const I18N_DICT = {
     "enterprise-title": "Enterprise &amp; commercial licensing",
     "enterprise-body": "The open-source edition is <strong>free, forever</strong> (AGPL-3.0) — companies are welcome to use it as-is. You only need a paid commercial license to step outside AGPL's copyleft: to <strong>customize Coffee CLI and keep your changes closed-source</strong>, <strong>ship it under your own brand / white-label</strong>, or <strong>embed it in a proprietary product you distribute</strong>. <strong>Custom development, priority support, and SLAs</strong> are available too. Tell us what you're building and we'll tailor a quote.",
     "enterprise-contact": "Contact us: hi@coffeecli.com",
-    "downloads-note": "<strong>macOS:</strong> if it won't open on first launch, run <code>xattr -cr '/Applications/Coffee CLI.app'</code> in Terminal, then reopen. <strong>Linux:</strong> may need extra terminal steps after download.",
+    "downloads-note": "<strong>macOS:</strong> if it won't open on first launch, run <code>xattr -cr '/Applications/Coffee CLI Mechoy.app'</code> in Terminal, then reopen. <strong>Linux:</strong> may need extra terminal steps after download.",
     "downloads-other": "Other variants (Intel Mac · ARM Linux · AppImage) →"
   },
   zh: {
@@ -72,7 +72,7 @@ const I18N_DICT = {
     "enterprise-title": "企业采购 / 商业授权",
     "enterprise-body": "开源版<strong>永久免费</strong>(AGPL-3.0),企业可原样使用。仅当需要跳出 AGPL 开源义务时才需付费商业授权:<strong>定制并保持改动闭源</strong>、<strong>以自有品牌 / 白标对外分发</strong>,或<strong>嵌入贵司要分发的商业产品</strong>。也提供<strong>定制开发、优先支持与 SLA</strong>。告诉我们贵司的用途与需求,我们按需出方案与报价。",
     "enterprise-contact": "联系采购：hi@coffeecli.com",
-    "downloads-note": "<strong>macOS：</strong>首次打开若无反应或提示「已损坏」，在「终端」运行 <code>xattr -cr '/Applications/Coffee CLI.app'</code> 后重新打开即可。<strong>Linux：</strong>下载后可能需要额外终端步骤。",
+    "downloads-note": "<strong>macOS：</strong>首次打开若无反应或提示「已损坏」，在「终端」运行 <code>xattr -cr '/Applications/Coffee CLI Mechoy.app'</code> 后重新打开即可。<strong>Linux：</strong>下载后可能需要额外终端步骤。",
     "downloads-other": "其他版本（Intel Mac · ARM Linux · AppImage）→",
     "cn-mirrors-title": "其他下载渠道：",
     "cn-mirrors-baidu": "百度网盘",
@@ -92,7 +92,7 @@ const I18N_DICT = {
     "enterprise-title": "企業採購 / 商業授權",
     "enterprise-body": "開源版<strong>永久免費</strong>(AGPL-3.0),企業可原樣使用。僅當需要跳出 AGPL 開源義務時才需付費商業授權:<strong>定制並保持改動閉源</strong>、<strong>以自有品牌 / 白標對外分發</strong>,或<strong>嵌入貴司要分發的商業產品</strong>。也提供<strong>定制開發、優先支援與 SLA</strong>。告訴我們貴司的用途與需求,我們按需出方案與報價。",
     "enterprise-contact": "聯絡採購：hi@coffeecli.com",
-    "downloads-note": "<strong>macOS：</strong>首次開啟若無反應或提示「已損壞」，在「終端機」執行 <code>xattr -cr '/Applications/Coffee CLI.app'</code> 後重新開啟即可。<strong>Linux：</strong>下載後可能需要額外終端步驟。",
+    "downloads-note": "<strong>macOS：</strong>首次開啟若無反應或提示「已損壞」，在「終端機」執行 <code>xattr -cr '/Applications/Coffee CLI Mechoy.app'</code> 後重新開啟即可。<strong>Linux：</strong>下載後可能需要額外終端步驟。",
     "downloads-other": "其他版本（Intel Mac · ARM Linux · AppImage）→",
     "cn-mirrors-title": "其他下載渠道：",
     "cn-mirrors-baidu": "百度網盤",
@@ -112,7 +112,7 @@ const I18N_DICT = {
     "enterprise-title": "法人購入 / 商用ライセンス",
     "enterprise-body": "オープンソース版は<strong>ずっと無料</strong>(AGPL-3.0)で、そのまま業務利用いただけます。AGPL のコピーレフトを外れる場合のみ有償の商用ライセンスが必要です:<strong>カスタマイズしてソースを非公開にする</strong>、<strong>自社ブランド / ホワイトラベルで配布する</strong>、<strong>配布する自社製品に組み込む</strong>場合など。<strong>受託開発・優先サポート・SLA</strong> もご用意。用途をお知らせいただければお見積りします。",
     "enterprise-contact": "お問い合わせ：hi@coffeecli.com",
-    "downloads-note": "<strong>macOS：</strong>初回起動で開かない場合は、ターミナルで <code>xattr -cr '/Applications/Coffee CLI.app'</code> を実行してから開き直してください。<strong>Linux：</strong>ダウンロード後にターミナル操作が必要な場合があります。",
+    "downloads-note": "<strong>macOS：</strong>初回起動で開かない場合は、ターミナルで <code>xattr -cr '/Applications/Coffee CLI Mechoy.app'</code> を実行してから開き直してください。<strong>Linux：</strong>ダウンロード後にターミナル操作が必要な場合があります。",
     "downloads-other": "その他のバリアント（Intel Mac · ARM Linux · AppImage）→"
   },
   ko: {
@@ -127,7 +127,7 @@ const I18N_DICT = {
     "enterprise-title": "기업 구매 / 상용 라이선스",
     "enterprise-body": "오픈소스 에디션은 <strong>영구 무료</strong>(AGPL-3.0)이며 기업도 그대로 사용할 수 있습니다. AGPL 카피레프트를 벗어나려는 경우에만 유료 상용 라이선스가 필요합니다: <strong>커스터마이즈하고 변경 사항을 비공개로 유지</strong>, <strong>자체 브랜드 / 화이트라벨로 배포</strong>, 또는 <strong>배포하는 자사 제품에 내장</strong>. <strong>맞춤 개발·우선 지원·SLA</strong>도 제공합니다. 용도를 알려주시면 견적을 드립니다.",
     "enterprise-contact": "문의하기: hi@coffeecli.com",
-    "downloads-note": "<strong>macOS:</strong> 처음 실행 시 열리지 않으면 터미널에서 <code>xattr -cr '/Applications/Coffee CLI.app'</code> 를 실행한 뒤 다시 여세요. <strong>Linux:</strong> 다운로드 후 추가 터미널 작업이 필요할 수 있습니다.",
+    "downloads-note": "<strong>macOS:</strong> 처음 실행 시 열리지 않으면 터미널에서 <code>xattr -cr '/Applications/Coffee CLI Mechoy.app'</code> 를 실행한 뒤 다시 여세요. <strong>Linux:</strong> 다운로드 후 추가 터미널 작업이 필요할 수 있습니다.",
     "downloads-other": "기타 버전 (Intel Mac · ARM Linux · AppImage) →"
   },
   es: {
@@ -142,7 +142,7 @@ const I18N_DICT = {
     "enterprise-title": "Empresas y licencia comercial",
     "enterprise-body": "La edición de código abierto es <strong>gratis, para siempre</strong> (AGPL-3.0); las empresas pueden usarla tal cual. Solo necesitas una licencia comercial de pago para salir del copyleft de AGPL: <strong>personalizar Coffee CLI y mantener tus cambios cerrados</strong>, <strong>distribuirlo con tu propia marca / marca blanca</strong> o <strong>integrarlo en un producto propietario que distribuyas</strong>. También ofrecemos <strong>desarrollo a medida, soporte prioritario y SLA</strong>. Cuéntanos tu caso y te preparamos un presupuesto.",
     "enterprise-contact": "Contáctanos: hi@coffeecli.com",
-    "downloads-note": "<strong>macOS:</strong> si no abre en el primer intento, ejecuta <code>xattr -cr '/Applications/Coffee CLI.app'</code> en la Terminal y vuelve a abrirla. <strong>Linux:</strong> puede requerir pasos extra en terminal tras descargar.",
+    "downloads-note": "<strong>macOS:</strong> si no abre en el primer intento, ejecuta <code>xattr -cr '/Applications/Coffee CLI Mechoy.app'</code> en la Terminal y vuelve a abrirla. <strong>Linux:</strong> puede requerir pasos extra en terminal tras descargar.",
     "downloads-other": "Otras variantes (Intel Mac · ARM Linux · AppImage) →"
   },
   fr: {
@@ -157,7 +157,7 @@ const I18N_DICT = {
     "enterprise-title": "Entreprises et licence commerciale",
     "enterprise-body": "L'édition open source est <strong>gratuite, pour toujours</strong> (AGPL-3.0) ; les entreprises peuvent l'utiliser telle quelle. Une licence commerciale payante n'est nécessaire que pour sortir du copyleft d'AGPL : <strong>personnaliser Coffee CLI en gardant vos modifications fermées</strong>, <strong>le distribuer sous votre propre marque / marque blanche</strong>, ou <strong>l'intégrer à un produit propriétaire que vous distribuez</strong>. Nous proposons aussi <strong>développement sur mesure, support prioritaire et SLA</strong>. Décrivez-nous votre besoin et nous établirons un devis.",
     "enterprise-contact": "Contactez-nous : hi@coffeecli.com",
-    "downloads-note": "<strong>macOS :</strong> si l'app ne s'ouvre pas au premier lancement, exécutez <code>xattr -cr '/Applications/Coffee CLI.app'</code> dans le Terminal, puis rouvrez-la. <strong>Linux :</strong> peut nécessiter des étapes supplémentaires en terminal après téléchargement.",
+    "downloads-note": "<strong>macOS :</strong> si l'app ne s'ouvre pas au premier lancement, exécutez <code>xattr -cr '/Applications/Coffee CLI Mechoy.app'</code> dans le Terminal, puis rouvrez-la. <strong>Linux :</strong> peut nécessiter des étapes supplémentaires en terminal après téléchargement.",
     "downloads-other": "Autres variantes (Intel Mac · ARM Linux · AppImage) →"
   },
   de: {
@@ -172,7 +172,7 @@ const I18N_DICT = {
     "enterprise-title": "Unternehmen & kommerzielle Lizenz",
     "enterprise-body": "Die Open-Source-Edition ist <strong>für immer kostenlos</strong> (AGPL-3.0) — Unternehmen dürfen sie unverändert nutzen. Eine kostenpflichtige kommerzielle Lizenz brauchst du nur, um das Copyleft der AGPL zu verlassen: <strong>Coffee CLI anpassen und Änderungen geschlossen halten</strong>, <strong>unter eigener Marke / White-Label vertreiben</strong> oder <strong>in ein proprietäres Produkt einbetten, das du vertreibst</strong>. Auch <strong>Individualentwicklung, priorisierter Support und SLAs</strong> sind möglich. Schildere uns dein Vorhaben, wir erstellen ein Angebot.",
     "enterprise-contact": "Kontakt: hi@coffeecli.com",
-    "downloads-note": "<strong>macOS:</strong> Öffnet sie sich beim ersten Start nicht, führe <code>xattr -cr '/Applications/Coffee CLI.app'</code> im Terminal aus und öffne sie erneut. <strong>Linux:</strong> braucht nach dem Download eventuell zusätzliche Terminal-Schritte.",
+    "downloads-note": "<strong>macOS:</strong> Öffnet sie sich beim ersten Start nicht, führe <code>xattr -cr '/Applications/Coffee CLI Mechoy.app'</code> im Terminal aus und öffne sie erneut. <strong>Linux:</strong> braucht nach dem Download eventuell zusätzliche Terminal-Schritte.",
     "downloads-other": "Andere Varianten (Intel Mac · ARM Linux · AppImage) →"
   },
   pt: {
@@ -187,7 +187,7 @@ const I18N_DICT = {
     "enterprise-title": "Empresas e licença comercial",
     "enterprise-body": "A edição open source é <strong>gratuita, para sempre</strong> (AGPL-3.0); empresas podem usá-la como está. Você só precisa de uma licença comercial paga para sair do copyleft da AGPL: <strong>personalizar o Coffee CLI e manter suas mudanças fechadas</strong>, <strong>distribuí-lo sob sua própria marca / white-label</strong> ou <strong>incorporá-lo a um produto proprietário que você distribui</strong>. Também oferecemos <strong>desenvolvimento sob medida, suporte prioritário e SLA</strong>. Conte seu caso e preparamos um orçamento.",
     "enterprise-contact": "Fale conosco: hi@coffeecli.com",
-    "downloads-note": "<strong>macOS:</strong> se não abrir na primeira vez, execute <code>xattr -cr '/Applications/Coffee CLI.app'</code> no Terminal e abra novamente. <strong>Linux:</strong> pode exigir etapas extras no terminal após o download.",
+    "downloads-note": "<strong>macOS:</strong> se não abrir na primeira vez, execute <code>xattr -cr '/Applications/Coffee CLI Mechoy.app'</code> no Terminal e abra novamente. <strong>Linux:</strong> pode exigir etapas extras no terminal após o download.",
     "downloads-other": "Outras variantes (Intel Mac · ARM Linux · AppImage) →"
   },
   ru: {
@@ -202,7 +202,7 @@ const I18N_DICT = {
     "enterprise-title": "Для бизнеса и коммерческая лицензия",
     "enterprise-body": "Открытая редакция <strong>бесплатна навсегда</strong> (AGPL-3.0) — компании могут использовать её как есть. Платная коммерческая лицензия нужна только чтобы выйти за рамки копилефта AGPL: <strong>доработать Coffee CLI и оставить изменения закрытыми</strong>, <strong>распространять под своим брендом / white-label</strong> или <strong>встроить в проприетарный продукт, который вы распространяете</strong>. Также доступны <strong>индивидуальная разработка, приоритетная поддержка и SLA</strong>. Опишите задачу — подготовим предложение.",
     "enterprise-contact": "Связаться: hi@coffeecli.com",
-    "downloads-note": "<strong>macOS:</strong> если не открывается при первом запуске, выполните <code>xattr -cr '/Applications/Coffee CLI.app'</code> в Терминале и откройте снова. <strong>Linux:</strong> после скачивания могут потребоваться дополнительные шаги в терминале.",
+    "downloads-note": "<strong>macOS:</strong> если не открывается при первом запуске, выполните <code>xattr -cr '/Applications/Coffee CLI Mechoy.app'</code> в Терминале и откройте снова. <strong>Linux:</strong> после скачивания могут потребоваться дополнительные шаги в терминале.",
     "downloads-other": "Другие варианты (Intel Mac · ARM Linux · AppImage) →"
   }
 };
@@ -610,54 +610,54 @@ function typeLoop() {
 
 const INSTALL_DATA = {
   en: {
-    windows: { hint: "Right-click Start > Terminal (Admin) > Paste:", command: "iwr -useb https://coffeecli.com/install.ps1 | iex" },
-    macos: { hint: "Open Terminal.app and paste the following:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" },
-    linux: { hint: "For any modern Linux distribution, run:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" }
+    windows: { hint: "Right-click Start > Terminal (Admin) > Paste:", command: "iwr -useb https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex" },
+    macos: { hint: "Open Terminal.app and paste the following:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" },
+    linux: { hint: "For any modern Linux distribution, run:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" }
   },
   zh: {
-    windows: { hint: "右键单击 开始菜单 > 选择“终端管理员” > 粘贴执行:", command: "iwr -useb https://coffeecli.com/install.ps1 | iex" },
-    macos: { hint: "利用 Spotlight 或 Launchpad 启动终端，粘贴并在其中执行:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" },
-    linux: { hint: "打开您的日常终端引擎，执行此快速部署脚本:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" }
+    windows: { hint: "右键单击 开始菜单 > 选择“终端管理员” > 粘贴执行:", command: "iwr -useb https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex" },
+    macos: { hint: "利用 Spotlight 或 Launchpad 启动终端，粘贴并在其中执行:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" },
+    linux: { hint: "打开您的日常终端引擎，执行此快速部署脚本:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" }
   },
   "zh-TW": {
-    windows: { hint: "右鍵單擊 開始菜單 > 選擇「終端機管理員」 > 貼上執行:", command: "iwr -useb https://coffeecli.com/install.ps1 | iex" },
-    macos: { hint: "利用 Spotlight 或 Launchpad 啟動終端機，貼上並執行:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" },
-    linux: { hint: "打開您的日常終端引擎，執行此快速部署腳本:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" }
+    windows: { hint: "右鍵單擊 開始菜單 > 選擇「終端機管理員」 > 貼上執行:", command: "iwr -useb https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex" },
+    macos: { hint: "利用 Spotlight 或 Launchpad 啟動終端機，貼上並執行:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" },
+    linux: { hint: "打開您的日常終端引擎，執行此快速部署腳本:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" }
   },
   ja: {
-    windows: { hint: "スタートメニューを右クリック > Terminal(Admin) > 貼り付け:", command: "iwr -useb https://coffeecli.com/install.ps1 | iex" },
-    macos: { hint: "Terminal.appを開いて以下のコマンドを貼り付け:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" },
-    linux: { hint: "ターミナルを開いて以下のコマンドを実行:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" }
+    windows: { hint: "スタートメニューを右クリック > Terminal(Admin) > 貼り付け:", command: "iwr -useb https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex" },
+    macos: { hint: "Terminal.appを開いて以下のコマンドを貼り付け:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" },
+    linux: { hint: "ターミナルを開いて以下のコマンドを実行:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" }
   },
   ko: {
-    windows: { hint: "시작 메뉴 우 클릭 > 터미널(관리자) > 붙여넣기:", command: "iwr -useb https://coffeecli.com/install.ps1 | iex" },
-    macos: { hint: "Terminal.app을 열고 다음 명령어를 붙여넣기:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" },
-    linux: { hint: "터미널을 열고 다음 명령어 실행:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" }
+    windows: { hint: "시작 메뉴 우 클릭 > 터미널(관리자) > 붙여넣기:", command: "iwr -useb https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex" },
+    macos: { hint: "Terminal.app을 열고 다음 명령어를 붙여넣기:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" },
+    linux: { hint: "터미널을 열고 다음 명령어 실행:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" }
   },
   es: {
-    windows: { hint: "Clic derecho en Inicio > Terminal (Admin) > Pegar:", command: "iwr -useb https://coffeecli.com/install.ps1 | iex" },
-    macos: { hint: "Abre Terminal.app y pega el siguiente comando:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" },
-    linux: { hint: "Para cualquier distribución moderna de Linux, ejecuta:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" }
+    windows: { hint: "Clic derecho en Inicio > Terminal (Admin) > Pegar:", command: "iwr -useb https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex" },
+    macos: { hint: "Abre Terminal.app y pega el siguiente comando:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" },
+    linux: { hint: "Para cualquier distribución moderna de Linux, ejecuta:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" }
   },
   fr: {
-    windows: { hint: "Clic droit sur Démarrer > Terminal (Admin) > Coller:", command: "iwr -useb https://coffeecli.com/install.ps1 | iex" },
-    macos: { hint: "Ouvrez Terminal.app et collez la commande suivante:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" },
-    linux: { hint: "Pour toute distribution Linux moderne, exécutez:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" }
+    windows: { hint: "Clic droit sur Démarrer > Terminal (Admin) > Coller:", command: "iwr -useb https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex" },
+    macos: { hint: "Ouvrez Terminal.app et collez la commande suivante:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" },
+    linux: { hint: "Pour toute distribution Linux moderne, exécutez:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" }
   },
   de: {
-    windows: { hint: "Rechtsklick auf Start > Terminal (Admin) > Einfügen:", command: "iwr -useb https://coffeecli.com/install.ps1 | iex" },
-    macos: { hint: "Öffnen Sie Terminal.app und fügen Sie folgenden Befehl ein:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" },
-    linux: { hint: "Für jede moderne Linux-Distribution ausführen:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" }
+    windows: { hint: "Rechtsklick auf Start > Terminal (Admin) > Einfügen:", command: "iwr -useb https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex" },
+    macos: { hint: "Öffnen Sie Terminal.app und fügen Sie folgenden Befehl ein:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" },
+    linux: { hint: "Für jede moderne Linux-Distribution ausführen:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" }
   },
   pt: {
-    windows: { hint: "Clique direito no Iniciar > Terminal (Admin) > Colar:", command: "iwr -useb https://coffeecli.com/install.ps1 | iex" },
-    macos: { hint: "Abra o Terminal.app e cole o seguinte comando:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" },
-    linux: { hint: "Para qualquer distribuição Linux moderna, execute:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" }
+    windows: { hint: "Clique direito no Iniciar > Terminal (Admin) > Colar:", command: "iwr -useb https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex" },
+    macos: { hint: "Abra o Terminal.app e cole o seguinte comando:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" },
+    linux: { hint: "Para qualquer distribuição Linux moderna, execute:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" }
   },
   ru: {
-    windows: { hint: "Щелкните правой кнопкой Пуск > Терминал (Администратор) > Вставить:", command: "iwr -useb https://coffeecli.com/install.ps1 | iex" },
-    macos: { hint: "Откройте Terminal.app и вставьте следующую команду:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" },
-    linux: { hint: "Для любого современного дистрибутива Linux выполните:", command: "curl -fsSL https://coffeecli.com/install.sh | sh" }
+    windows: { hint: "Щелкните правой кнопкой Пуск > Терминал (Администратор) > Вставить:", command: "iwr -useb https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.ps1 | iex" },
+    macos: { hint: "Откройте Terminal.app и вставьте следующую команду:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" },
+    linux: { hint: "Для любого современного дистрибутива Linux выполните:", command: "curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh" }
   }
 };
 

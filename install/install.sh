@@ -1,29 +1,18 @@
 #!/bin/sh
-# Coffee CLI — macOS / Linux Installer / Updater
-# Usage:   curl -fsSL https://coffeecli.com/install.sh | sh
-# License: AGPL-3.0-or-later (https://github.com/edison7009/Coffee-CLI/blob/main/LICENSE)
+# Coffee CLI Mechoy Build — macOS / Linux Installer / Updater
+# Usage:   curl -fsSL https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/install/install.sh | sh
+# License: AGPL-3.0-or-later (https://github.com/Mechoy/Coffee-CLI/blob/main/LICENSE)
 
 set -e
 
-# Resolve version and binary via coffeecli.com (CF-hosted, China-accessible).
-# /version.json?platform=<p> returns the latest release tag ONLY when that
-# platform's asset has been uploaded to GitHub Releases. If CI is still
-# mid-build (mac ARM usually finishes first, Linux/Windows take longer),
-# the endpoint reports an empty version for the not-yet-ready platforms.
-# That prevents the earlier race where the version bumped instantly but
-# the per-platform binary took another 15 min to appear.
-# /download/<platform> is a CF Worker route that proxies the matching
-# GitHub Release asset. Keeps the install path off api.github.com so the
-# script doesn't stall on a blocked or slow GitHub API from mainland
-# networks.
-VERSION_BASE="https://coffeecli.com/version.json"
-DOWNLOAD_BASE="https://coffeecli.com/download"
-# Direct GitHub Releases fallback used when coffeecli.com is unreachable
-# (CF Worker outage, GitHub API rate limit on the shared Worker IP pool,
-# DNS issues). The user's own IP has its own 60/h anonymous quota and
-# won't share that pool, so this is meaningfully more reliable for the
-# single-user case.
-GITHUB_API="https://api.github.com/repos/edison7009/Coffee-CLI/releases/latest"
+# Mechoy builds read a CI-maintained marker from this fork. The marker changes
+# only after the matching release is published, avoiding GitHub API rate limits
+# and preventing an upstream installer from replacing local functionality.
+VERSION_MANIFEST="https://raw.githubusercontent.com/Mechoy/Coffee-CLI/main/Web-Home/mechoy-version.json"
+PRODUCT_NAME="Coffee CLI Mechoy"
+PRODUCT_PACKAGE="coffee-cli-mechoy"
+PRODUCT_APP_PATH="/Applications/Coffee CLI Mechoy.app"
+PRODUCT_BINARY="coffee-cli-mechoy"
 
 # Resolve escape sequences via printf at assignment time so the
 # variables hold real ESC bytes. Plain '\033[...m' string literals
@@ -37,18 +26,30 @@ YELLOW=$(printf '\033[0;33m')
 RED=$(printf '\033[0;31m')
 RESET=$(printf '\033[0m')
 
+version_is_at_least() {
+  awk -v installed="$1" -v latest="$2" '
+    BEGIN {
+      split(installed, current, ".");
+      split(latest, target, ".");
+      for (i = 1; i <= 3; i++) {
+        current_part = current[i] + 0;
+        target_part = target[i] + 0;
+        if (current_part > target_part) exit 0;
+        if (current_part < target_part) exit 1;
+      }
+      exit 0;
+    }
+  '
+}
+
 echo ""
-echo "  ${CYAN}Coffee CLI Installer${RESET}"
+echo "  ${CYAN}${PRODUCT_NAME} Installer${RESET}"
 echo "  ${GRAY}────────────────────${RESET}"
 
 OS=$(uname -s)
 ARCH=$(uname -m)
 
-# Detect the concrete platform slug we'll hit on both /version.json and
-# /download. Picking this before the version lookup lets the server tell
-# us precisely whether OUR platform's installer is ready yet, rather than
-# reporting that SOME platform has a new release and then failing at
-# download time.
+# Detect the concrete platform and the exact release asset expected for it.
 PLATFORM=""
 if [ "$OS" = "Darwin" ]; then
   # macOS ships native builds for both Apple Silicon and Intel since v2.7.6
@@ -65,16 +66,13 @@ if [ "$OS" = "Darwin" ]; then
     *)
       echo "  ${RED}Unsupported macOS architecture: $ARCH${RESET}"
       echo "  ${YELLOW}Coffee CLI ships arm64 and Intel x64 macOS builds.${RESET}"
-      echo "  ${YELLOW}Open an issue: https://github.com/edison7009/Coffee-CLI/issues${RESET}"
+      echo "  ${YELLOW}Open an issue: https://github.com/Mechoy/Coffee-CLI/issues${RESET}"
       exit 1
       ;;
   esac
 elif [ "$OS" = "Linux" ]; then
   # We ship amd64 and arm64 Linux artifacts. Pick the slug based on
-  # `uname -m`. Anything outside the two known arch families (armv7,
-  # riscv64, ppc64le …) fails fast — without this guard those would
-  # request an amd64 asset, get 404, and curl's --retry-all-errors
-  # would burn five retry attempts on a request that can never succeed.
+    # `uname -m`. Anything outside the two known arch families fails fast.
   case "$ARCH" in
     x86_64|amd64)
       LINUX_ARCH="amd64"
@@ -85,14 +83,13 @@ elif [ "$OS" = "Linux" ]; then
     *)
       echo "  ${RED}Unsupported Linux architecture: $ARCH${RESET}"
       echo "  ${YELLOW}Coffee CLI currently ships amd64 and arm64 Linux builds only.${RESET}"
-      echo "  ${YELLOW}Open an issue: https://github.com/edison7009/Coffee-CLI/issues${RESET}"
+      echo "  ${YELLOW}Open an issue: https://github.com/Mechoy/Coffee-CLI/issues${RESET}"
       exit 1
       ;;
   esac
   # Prefer dpkg (.deb on Debian/Ubuntu) → rpm (.rpm on Fedora/RHEL/
   # openSUSE/CentOS) → AppImage (everything else, including Arch /
-  # NixOS / minimal containers). Each branch picks the arch-matching
-  # platform slug we'll send to /version.json and /download.
+  # NixOS / minimal containers).
   if command -v dpkg > /dev/null 2>&1; then
     if [ "$LINUX_ARCH" = "arm64" ]; then
       PLATFORM="linux-arm64-deb"
@@ -117,52 +114,31 @@ else
   exit 1
 fi
 
-# Pattern that picks our platform's asset out of the GitHub release.
-# Mirrors the matchers in Web-Home/_worker.js — keep the two in sync.
-# v1.9.2+ uses platform-labelled filenames (Linux_x64.deb / macOS_arm64.dmg
-# / Windows_x64-setup.exe); we OR with the pre-v1.9.2 patterns so the
-# direct-from-GitHub fallback still resolves older releases that someone
-# might manually re-publish.
+# Suffix for the exact custom asset produced by release.yml. Do not accept
+# legacy/upstream-shaped names here: a Mechoy build must never install them.
 case "$PLATFORM" in
-  macos-arm)            ASSET_GREP='(macOS_arm64|aarch64[^\"]*)\.dmg' ;;
-  macos-intel)          ASSET_GREP='(macOS_x64|_x64)\.dmg' ;;
-  linux-deb)            ASSET_GREP='(Linux_x64|amd64)\.deb' ;;
-  linux-rpm)            ASSET_GREP='(Linux_x64\.rpm|x86_64\.rpm)' ;;
-  linux-appimage)       ASSET_GREP='(Linux_x64|amd64)\.AppImage' ;;
-  linux-arm64-deb)      ASSET_GREP='(Linux_arm64|arm64)\.deb' ;;
-  linux-arm64-rpm)      ASSET_GREP='(Linux_arm64\.rpm|aarch64\.rpm)' ;;
-  linux-arm64-appimage) ASSET_GREP='(Linux_arm64|aarch64)\.AppImage' ;;
+  macos-arm)            ASSET_SUFFIX="macOS_arm64.dmg" ;;
+  macos-intel)          ASSET_SUFFIX="macOS_x64.dmg" ;;
+  linux-deb)            ASSET_SUFFIX="Linux_x64.deb" ;;
+  linux-rpm)            ASSET_SUFFIX="Linux_x64.rpm" ;;
+  linux-appimage)       ASSET_SUFFIX="Linux_x64.AppImage" ;;
+  linux-arm64-deb)      ASSET_SUFFIX="Linux_arm64.deb" ;;
+  linux-arm64-rpm)      ASSET_SUFFIX="Linux_arm64.rpm" ;;
+  linux-arm64-appimage) ASSET_SUFFIX="Linux_arm64.AppImage" ;;
 esac
 
 FALLBACK_DOWNLOAD_URL=""
+LATEST_VER=""
 
-# Parse version from version.json — minimal JSON, no jq required
+# Resolve the latest published custom release. The marker contains only a
+# numeric x.y.z value, from which the isolated tag and exact asset name are
+# derived without an unauthenticated GitHub Releases API request.
 echo "  ${GRAY}Fetching latest version...${RESET}"
-VERSION_JSON=$(curl -fsSL "$VERSION_BASE?platform=$PLATFORM" 2>/dev/null || true)
-LATEST_VER=$(echo "$VERSION_JSON" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
-
-# coffeecli.com unreachable (CF Worker 502 / network) → fall back to
-# api.github.com directly. This pulls the latest release JSON, extracts
-# tag_name for the version and the matching asset's browser_download_url
-# for the later download step (so we don't hit coffeecli.com a second
-# time and fail again).
-if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" = "$VERSION_JSON" ]; then
-  echo "  ${GRAY}Trying GitHub directly...${RESET}"
-  GH_JSON=$(curl -fsSL -H "User-Agent: CoffeeCLI-Install" "$GITHUB_API" 2>/dev/null || true)
-  if [ -n "$GH_JSON" ]; then
-    GH_TAG=$(echo "$GH_JSON" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')
-    LATEST_VER=$(echo "$GH_TAG" | sed 's/^v//')
-    if [ -n "$ASSET_GREP" ]; then
-      FALLBACK_DOWNLOAD_URL=$(echo "$GH_JSON" | grep -oE "\"browser_download_url\"[[:space:]]*:[[:space:]]*\"[^\"]*${ASSET_GREP}\"" | head -1 | sed -E 's/.*"(https[^"]*)"$/\1/')
-      # GitHub returned a release tag, but our platform's asset hasn't
-      # been uploaded yet (mid-CI). Reset LATEST_VER so the "try again
-      # in 10 minutes" branch below fires, instead of advertising a
-      # version we can't actually deliver.
-      if [ -z "$FALLBACK_DOWNLOAD_URL" ]; then
-        LATEST_VER=""
-      fi
-    fi
-  fi
+VERSION_JSON=$(curl -fsSL -H "User-Agent: CoffeeCLI-Mechoy-Install" "$VERSION_MANIFEST" 2>/dev/null || true)
+LATEST_VER=$(printf '%s\n' "$VERSION_JSON" | sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p')
+if [ -n "$LATEST_VER" ]; then
+  EXPECTED_ASSET="Coffee.CLI_Mechoy_${LATEST_VER}_${ASSET_SUFFIX}"
+  FALLBACK_DOWNLOAD_URL="https://github.com/Mechoy/Coffee-CLI/releases/download/mechoy-v${LATEST_VER}/${EXPECTED_ASSET}"
 fi
 
 # Empty `version` = the installer for this platform isn't out yet (CI
@@ -170,11 +146,10 @@ fi
 # "come back later" message and pause so the window doesn't auto-close
 # on the user before they read it (some launch flows spawn a fresh
 # terminal that closes the moment the script returns).
-if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" = "$VERSION_JSON" ]; then
+if [ -z "$LATEST_VER" ]; then
   echo ""
-  echo "  ${YELLOW}A new version of Coffee CLI was just released.${RESET}"
-  echo "  ${YELLOW}The server is currently redeploying.${RESET}"
-  echo "  ${YELLOW}Please try again in about 10 minutes.${RESET}"
+  echo "  ${YELLOW}No matching Mechoy Build installer is available yet.${RESET}"
+  echo "  ${YELLOW}Check the release status and try again in about 10 minutes.${RESET}"
   echo ""
   # Read from /dev/tty since stdin is consumed by `curl | sh`. If no tty
   # is attached (CI / redirected), skip the prompt and exit silently.
@@ -192,26 +167,33 @@ if [ "$OS" = "Darwin" ]; then
 
   # Detect installed version
   INSTALLED_VER=""
-  APP_PATH="/Applications/Coffee CLI.app"
+  APP_PATH="$PRODUCT_APP_PATH"
   if [ -d "$APP_PATH" ]; then
     INSTALLED_VER=$(defaults read "$APP_PATH/Contents/Info" CFBundleShortVersionString 2>/dev/null || true)
   fi
 
   if [ -n "$INSTALLED_VER" ]; then
     echo "  ${GRAY}Installed: v$INSTALLED_VER${RESET}"
-    if [ "$INSTALLED_VER" = "$LATEST_VER" ]; then
+    if version_is_at_least "$INSTALLED_VER" "$LATEST_VER"; then
       echo ""
-      echo "  ${GREEN}Coffee CLI is already up to date (v$INSTALLED_VER).${RESET}"
+      if [ "$INSTALLED_VER" = "$LATEST_VER" ]; then
+        echo "  ${GREEN}${PRODUCT_NAME} is already up to date (v$INSTALLED_VER).${RESET}"
+      else
+        echo "  ${GREEN}A newer ${PRODUCT_NAME} build is already installed (v$INSTALLED_VER).${RESET}"
+      fi
       echo ""
       exit 0
     fi
     echo "  ${YELLOW}Upgrading v$INSTALLED_VER  →  v$LATEST_VER ...${RESET}"
   else
+    if [ -d "/Applications/Coffee CLI.app" ]; then
+      echo "  ${YELLOW}A legacy Coffee CLI app was found and will be left unchanged.${RESET}"
+    fi
     echo "  ${GRAY}Not installed — performing fresh install...${RESET}"
   fi
 
-  URL="${FALLBACK_DOWNLOAD_URL:-$DOWNLOAD_BASE/$PLATFORM}"
-  TMP="/tmp/coffee-cli-v${LATEST_VER}.dmg"
+  URL="$FALLBACK_DOWNLOAD_URL"
+  TMP="/tmp/coffee-cli-mechoy-v${LATEST_VER}.dmg"
   # Always wipe any leftover bytes before downloading. Resume (`-C -`)
   # was REMOVED on purpose: when curl receives a CF 502 / connection
   # reset mid-response (error 56), it has already written the partial
@@ -268,10 +250,10 @@ if [ "$OS" = "Darwin" ]; then
   # the dock icon does nothing, no error dialog. Removing the xattr
   # tells LaunchServices the user has explicitly opted to trust this
   # binary (equivalent to right-click → Open the first time).
-  xattr -dr com.apple.quarantine "/Applications/Coffee CLI.app" 2>/dev/null || true
+  xattr -dr com.apple.quarantine "$PRODUCT_APP_PATH" 2>/dev/null || true
 
   echo ""
-  echo "  ${GREEN}Done! Coffee CLI v$LATEST_VER installed.${RESET}"
+  echo "  ${GREEN}Done! ${PRODUCT_NAME} v$LATEST_VER installed.${RESET}"
   echo "  ${GRAY}Launch it from /Applications or Spotlight.${RESET}"
 
 # ── Linux ──────────────────────────────────────────────────────────────────────
@@ -280,23 +262,39 @@ elif [ "$OS" = "Linux" ]; then
   # Detect installed version — prefer package manager
   INSTALLED_VER=""
   if command -v dpkg > /dev/null 2>&1; then
-    INSTALLED_VER=$(dpkg -s coffee-cli 2>/dev/null | grep '^Version:' | sed 's/Version: //' || true)
+    INSTALLED_VER=$(dpkg -s "$PRODUCT_PACKAGE" 2>/dev/null | grep '^Version:' | sed 's/Version: //' || true)
   fi
   if [ -z "$INSTALLED_VER" ] && command -v rpm > /dev/null 2>&1; then
-    INSTALLED_VER=$(rpm -q --queryformat '%{VERSION}' coffee-cli 2>/dev/null || true)
+    INSTALLED_VER=$(rpm -q --queryformat '%{VERSION}' "$PRODUCT_PACKAGE" 2>/dev/null || true)
   fi
 
   if [ -n "$INSTALLED_VER" ]; then
     echo "  ${GRAY}Installed: v$INSTALLED_VER${RESET}"
-    if [ "$INSTALLED_VER" = "$LATEST_VER" ]; then
+    if version_is_at_least "$INSTALLED_VER" "$LATEST_VER"; then
       echo ""
-      echo "  ${GREEN}Coffee CLI is already up to date (v$INSTALLED_VER).${RESET}"
+      if [ "$INSTALLED_VER" = "$LATEST_VER" ]; then
+        echo "  ${GREEN}${PRODUCT_NAME} is already up to date (v$INSTALLED_VER).${RESET}"
+      else
+        echo "  ${GREEN}A newer ${PRODUCT_NAME} build is already installed (v$INSTALLED_VER).${RESET}"
+      fi
       echo ""
       exit 0
     fi
-    echo "  ${YELLOW}Upgrading v$INSTALLED_VER  →  v$LATEST_VER ...${RESET}"
+    echo "  ${YELLOW}Upgrading ${PRODUCT_NAME} v$INSTALLED_VER  →  v$LATEST_VER ...${RESET}"
   else
     echo "  ${GRAY}Not installed — performing fresh install...${RESET}"
+  fi
+
+  # The Mechoy package has a distinct package name, but both it and the
+  # upstream package expose /usr/bin/coffee-cli for existing hooks and shell
+  # integrations. Refuse the ambiguous side-by-side package install instead
+  # of letting dpkg/rpm overwrite files or report a cryptic conflict.
+  if { command -v dpkg > /dev/null 2>&1 && dpkg -s coffee-cli > /dev/null 2>&1; } \
+    || { command -v rpm > /dev/null 2>&1 && rpm -q coffee-cli > /dev/null 2>&1; }; then
+    echo ""
+    echo "  ${YELLOW}An older Coffee CLI package is installed.${RESET}"
+    echo "  ${YELLOW}Remove that package before installing ${PRODUCT_NAME}; ~/.coffee-cli data is preserved.${RESET}"
+    exit 1
   fi
 
   # Prefer .deb (Debian/Ubuntu) → .rpm (Fedora/RHEL/openSUSE) → AppImage.
@@ -306,10 +304,10 @@ elif [ "$OS" = "Linux" ]; then
   # `apt remove` / `dnf remove`); AppImage is portable but the user
   # has to ensure ~/.local/bin is in PATH themselves.
   if command -v dpkg > /dev/null 2>&1; then
-    TMP="/tmp/coffee-cli-v${LATEST_VER}.deb"
+    TMP="/tmp/coffee-cli-mechoy-v${LATEST_VER}.deb"
     rm -f "$TMP"
     echo "  ${GRAY}Downloading .deb package...${RESET}"
-    DL_URL="${FALLBACK_DOWNLOAD_URL:-$DOWNLOAD_BASE/$PLATFORM}"
+    DL_URL="$FALLBACK_DOWNLOAD_URL"
     if ! curl -fL --progress-bar --retry 5 --retry-all-errors --retry-delay 2 "$DL_URL" -o "$TMP"; then
       echo ""
       echo "  ${RED}Download failed.${RESET}"
@@ -321,15 +319,15 @@ elif [ "$OS" = "Linux" ]; then
     sudo dpkg -i "$TMP"
     rm "$TMP"
     echo ""
-    echo "  ${GREEN}Done! Coffee CLI v$LATEST_VER installed.${RESET}"
+    echo "  ${GREEN}Done! ${PRODUCT_NAME} v$LATEST_VER installed.${RESET}"
     exit 0
   fi
 
   if command -v rpm > /dev/null 2>&1; then
-    TMP="/tmp/coffee-cli-v${LATEST_VER}.rpm"
+    TMP="/tmp/coffee-cli-mechoy-v${LATEST_VER}.rpm"
     rm -f "$TMP"
     echo "  ${GRAY}Downloading .rpm package...${RESET}"
-    DL_URL="${FALLBACK_DOWNLOAD_URL:-$DOWNLOAD_BASE/$PLATFORM}"
+    DL_URL="$FALLBACK_DOWNLOAD_URL"
     if ! curl -fL --progress-bar --retry 5 --retry-all-errors --retry-delay 2 "$DL_URL" -o "$TMP"; then
       echo ""
       echo "  ${RED}Download failed.${RESET}"
@@ -352,20 +350,20 @@ elif [ "$OS" = "Linux" ]; then
     fi
     rm "$TMP"
     echo ""
-    echo "  ${GREEN}Done! Coffee CLI v$LATEST_VER installed.${RESET}"
+    echo "  ${GREEN}Done! ${PRODUCT_NAME} v$LATEST_VER installed.${RESET}"
     exit 0
   fi
 
   # AppImage fallback
-  DEST="$HOME/.local/bin/coffee-cli"
+  DEST="$HOME/.local/bin/$PRODUCT_BINARY"
   mkdir -p "$HOME/.local/bin"
   # Download to a versioned temp first, then move into place. Writing
   # straight to $DEST would clobber a working install if the download
   # failed partway.
-  TMP="/tmp/coffee-cli-v${LATEST_VER}.AppImage"
+  TMP="/tmp/coffee-cli-mechoy-v${LATEST_VER}.AppImage"
   rm -f "$TMP"
   echo "  ${GRAY}Downloading AppImage...${RESET}"
-  DL_URL="${FALLBACK_DOWNLOAD_URL:-$DOWNLOAD_BASE/$PLATFORM}"
+  DL_URL="$FALLBACK_DOWNLOAD_URL"
   if ! curl -fL --progress-bar --retry 5 --retry-all-errors --retry-delay 2 "$DL_URL" -o "$TMP"; then
     echo ""
     echo "  ${RED}Download failed.${RESET}"
@@ -377,7 +375,7 @@ elif [ "$OS" = "Linux" ]; then
   chmod +x "$DEST"
 
   echo ""
-  echo "  ${GREEN}Done! Coffee CLI v$LATEST_VER installed to $DEST${RESET}"
+  echo "  ${GREEN}Done! ${PRODUCT_NAME} v$LATEST_VER installed to $DEST${RESET}"
   echo "  ${GRAY}Make sure ~/.local/bin is in your PATH.${RESET}"
 
 fi

@@ -1,10 +1,10 @@
 [package]
 name = "coffee-cli"
-version = "3.3.5"
+version = "3.3.6"
 edition = "2021"
 description = "Lightweight Multi-layer AI CLI Terminal"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/edison7009/Coffee-CLI"
+repository = "https://github.com/Mechoy/Coffee-CLI"
 keywords = ["ai", "prompt", "coding", "llm", "tree-sitter"]
 categories = ["command-line-utilities", "development-tools"]
 build = "build.rs"
@@ -34,7 +34,7 @@ clap = { version = "4", features = ["derive"] }
 # builds, and our shipped UI explicitly blocks F12 / Ctrl+Shift+I and the
 # context menu (see src-ui/src/main.tsx + App.tsx). Dev builds get devtools
 # automatically without the feature flag, so dev workflow is unaffected.
-tauri = { version = "2", features = ["protocol-asset"] }
+tauri = { version = "2", features = ["protocol-asset", "macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
 
