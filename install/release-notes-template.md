@@ -1,39 +1,39 @@
 <details open>
 <summary><b>🇨🇳 简体中文</b></summary>
 
-- 🎨 **修复**:Frost 主题现在跟随你选择的主题明/暗色,不再固定一种配色。
-- 🐧 **修复(Linux)**:Frost 毛玻璃改用 KWin 原生模糊(KDE 桌面),视觉更通透真实;其他 Linux 桌面保持半透明玻璃质感。
+- **内部 Alpha 基础**：新增 Agent Runs 的持久化状态与恢复基础层。
+- **范围说明**：该基础层尚未提供界面、命令、Worker 或 Workflow MCP，不改变现有终端和多智能体工作流。
 
 </details>
 
 <details>
 <summary><b>🇹🇼 繁體中文</b></summary>
 
-- 🎨 **修復**:Frost 主題現在跟隨你選擇的主題明/暗色,不再固定一種配色。
-- 🐧 **修復(Linux)**:Frost 毛玻璃改用 KWin 原生模糊(KDE 桌面),視覺更通透真實;其他 Linux 桌面保持半透明玻璃質感。
+- **內部 Alpha 基礎**：新增 Agent Runs 的持久化狀態與復原基礎層。
+- **範圍說明**：此基礎層尚未提供介面、命令、Worker 或 Workflow MCP，不改變既有終端與多智能體工作流程。
 
 </details>
 
 <details>
 <summary><b>🇬🇧 English</b></summary>
 
-- 🎨 **Fix**: Frost now follows your selected theme's light/dark tone instead of a fixed tint.
-- 🐧 **Fix (Linux)**: Frost now uses KWin's native blur on KDE desktops for a more transparent, truer glass look. Other Linux compositors keep translucent glass.
+- **Internal Alpha foundation**: Added durable state and recovery groundwork for Agent Runs.
+- **Scope**: No UI, commands, Worker, or Workflow MCP are exposed yet; existing terminal and multi-agent workflows are unchanged.
 
 </details>
 
 <details>
 <summary><b>🇯🇵 日本語</b></summary>
 
-- 🎨 **修正**:Frost テーマが選択中のテーマの明暗に追従するように。固定の配色ではなくなりました。
-- 🐧 **修正(Linux)**:KDE デスクトップで Frost のぼかしが KWin のネイティブブラーを使用するように。より透明感のある、本物のガラスらしい見た目に。他の Linux デスクトップは半透明のまま。
+- **内部 Alpha 基盤**：Agent Runs 向けの永続状態と復元機能の基盤を追加しました。
+- **対象範囲**：UI、コマンド、Worker、Workflow MCP はまだ公開しておらず、既存のターミナルとマルチエージェントのワークフローは変わりません。
 
 </details>
 
 <details>
 <summary><b>🇰🇷 한국어</b></summary>
 
-- 🎨 **수정**:Frost 테마가 선택한 테마의 밝음/어두움을 따르도록 개선(고정 색상 제거).
-- 🐧 **수정(Linux)**:KDE 데스크톱에서 Frost 블러가 KWin 네이티브 블러를 사용하도록 개선. 더 투명하고 실제 유리 같은 느낌. 다른 Linux 데스크톱은 반투명 유지.
+- **내부 Alpha 기반**: Agent Runs의 영속 상태 및 복구 기반을 추가했습니다.
+- **범위**: UI, 명령, Worker 또는 Workflow MCP는 아직 공개하지 않았으며, 기존 터미널과 멀티 에이전트 워크플로는 변경되지 않습니다.
 
 </details>
