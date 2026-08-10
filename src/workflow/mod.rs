@@ -11,9 +11,9 @@ mod state_machine;
 mod store;
 
 pub use model::{
-    AgentStage, AttemptRecord, AttemptReport, AttemptState, ClaimedTask, ItemRecord, RunItemInput,
-    RunRecord, RunSnapshot, RunState, RunSummary, RunTemplate, TaskCounts, TaskRecord, TaskState,
-    WorkflowEvent,
+    AcceptedStageOutput, AgentStage, AttemptRecord, AttemptReport, AttemptState, ClaimedTask,
+    ItemRecord, RunItemInput, RunRecord, RunSnapshot, RunState, RunSummary, RunTemplate,
+    TaskCounts, TaskRecord, TaskState, WorkflowEvent,
 };
 #[allow(unused_imports)]
 pub use store::WorkflowStore;

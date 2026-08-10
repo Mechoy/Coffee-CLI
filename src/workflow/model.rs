@@ -176,6 +176,13 @@ pub struct RunSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AcceptedStageOutput {
+    pub stage_id: String,
+    pub stage_index: u32,
+    pub output: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClaimedTask {
     pub run_id: String,
     pub task_id: String,
@@ -184,6 +191,9 @@ pub struct ClaimedTask {
     pub item_id: String,
     pub client_key: String,
     pub item_input: Value,
+    /// Only accepted structured output from earlier stages of this same Item.
+    /// Terminal text and output from other Items never cross this boundary.
+    pub prior_outputs: Vec<AcceptedStageOutput>,
     pub stage: AgentStage,
 }
 

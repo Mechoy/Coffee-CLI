@@ -1,12 +1,13 @@
 use super::{
     model::{
-        validate_failure_summary, validate_stage_output, validate_template, validate_worker_id,
-        MAX_ITEM_INPUT_BYTES, MAX_OUTPUT_BYTES, MAX_TEMPLATE_BYTES, MAX_TOTAL_RUN_OUTPUT_BYTES,
+        validate_failure_summary, validate_json_value, validate_stage_output, validate_template,
+        validate_worker_id, MAX_ITEM_INPUT_BYTES, MAX_OUTPUT_BYTES, MAX_TEMPLATE_BYTES,
+        MAX_TOTAL_RUN_OUTPUT_BYTES,
     },
     state_machine::{derive_run_state, validate_attempt_transition, validate_task_transition},
-    AgentStage, AttemptRecord, AttemptReport, AttemptState, ClaimedTask, ItemRecord, RunItemInput,
-    RunRecord, RunSnapshot, RunState, RunSummary, RunTemplate, TaskCounts, TaskRecord, TaskState,
-    WorkflowEvent,
+    AcceptedStageOutput, AgentStage, AttemptRecord, AttemptReport, AttemptState, ClaimedTask,
+    ItemRecord, RunItemInput, RunRecord, RunSnapshot, RunState, RunSummary, RunTemplate,
+    TaskCounts, TaskRecord, TaskState, WorkflowEvent,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Value};
@@ -22,6 +23,7 @@ const SCHEMA_VERSION: i64 = 1;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
 const MAX_DATABASE_BYTES: i64 = 64 * 1024 * 1024;
 const MAX_EVENTS_PER_RUN: i64 = 20_000;
+const EVENT_COMPACTION_BATCH: i64 = 128;
 const MAX_STORED_JSON_BYTES: usize = MAX_TEMPLATE_BYTES;
 
 /// SQLite-backed source of truth for Agent Runs.
@@ -157,13 +159,7 @@ impl WorkflowStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
 
-        let active_attempts: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM attempts WHERE state IN ('dispatching', 'running')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
+        let active_attempts = active_attempt_count(&transaction)?;
         if active_attempts > 0 {
             return Ok(None);
         }
@@ -211,12 +207,14 @@ impl WorkflowStore {
         };
 
         let template: RunTemplate = decode_json(&template_json, "stored run template")?;
+        validate_template(&template)?;
         let stage = template
             .stages
             .get(stage_index as usize)
             .cloned()
             .ok_or_else(|| format!("Stored task {task_id} references a missing template stage"))?;
         let item_input = decode_json(&item_input_json, "stored item input")?;
+        let prior_outputs = load_prior_outputs(&transaction, &run_id, &item_id, stage_index)?;
         let attempt_number: i64 = transaction
             .query_row(
                 "SELECT COALESCE(MAX(number), 0) + 1 FROM attempts WHERE task_id = ?1",
@@ -266,6 +264,7 @@ impl WorkflowStore {
             item_id,
             client_key,
             item_input,
+            prior_outputs,
             stage,
         }))
     }
@@ -327,6 +326,11 @@ impl WorkflowStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
+        if report_is_already_accepted(&transaction, attempt_id, worker_id, &report)? {
+            // A worker can lose the response after a successful submission and
+            // retry the same report. Do not append a second terminal event.
+            return Ok(());
+        }
         let context =
             live_attempt_context(&transaction, attempt_id, worker_id, AttemptState::Running)?;
         let stage = stage_for_task(&transaction, &context.run_id, context.stage_index)?;
@@ -558,13 +562,15 @@ impl WorkflowStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
+        active_attempt_count(&transaction)?;
         let active: Vec<(String, String, String, String, String, String)> = {
             let mut statement = transaction
                 .prepare(
                     "SELECT a.id, a.task_id, a.worker_id, t.run_id, t.state, a.state
                      FROM attempts a
                      JOIN tasks t ON t.id = a.task_id
-                     WHERE a.state IN ('dispatching', 'running')",
+                     WHERE a.state IN ('dispatching', 'running')
+                       AND t.current_attempt_id = a.id",
                 )
                 .map_err(database_error)?;
             let rows = statement
@@ -588,7 +594,7 @@ impl WorkflowStore {
             let parsed_task = TaskState::parse(task_state)?;
             validate_attempt_transition(parsed_attempt, AttemptState::Interrupted)?;
             validate_task_transition(parsed_task, TaskState::Attention)?;
-            transaction
+            let updated_attempt = transaction
                 .execute(
                     "UPDATE attempts
                      SET state = 'interrupted', reason = ?1, ended_at = ?2
@@ -596,7 +602,12 @@ impl WorkflowStore {
                     params![reason, now as i64, attempt_id],
                 )
                 .map_err(database_error)?;
-            transaction
+            if updated_attempt != 1 {
+                return Err(
+                    "Workflow attempt changed before crash recovery could interrupt it".to_string(),
+                );
+            }
+            let updated_task = transaction
                 .execute(
                     "UPDATE tasks
                      SET state = 'attention', failure_reason = ?1,
@@ -605,6 +616,12 @@ impl WorkflowStore {
                     params![reason, now as i64, task_id, attempt_id],
                 )
                 .map_err(database_error)?;
+            if updated_task != 1 {
+                return Err(
+                    "Workflow task changed before crash recovery could mark it for attention"
+                        .to_string(),
+                );
+            }
             append_event(
                 &transaction,
                 run_id,
@@ -625,13 +642,17 @@ impl WorkflowStore {
     }
 
     pub fn get_run(&self, run_id: &str) -> Result<RunSnapshot, String> {
-        let connection = self.connection()?;
-        let run = load_run(&connection, run_id)?;
-        let items = load_items(&connection, run_id)?;
-        let tasks = load_tasks(&connection, run_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(database_error)?;
+        let run = load_run(&transaction, run_id)?;
+        let items = load_items(&transaction, run_id)?;
+        let tasks = load_tasks(&transaction, run_id)?;
         let task_ids = tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
-        let attempts = load_attempts(&connection, &task_ids)?;
-        let events = load_events(&connection, run_id)?;
+        let attempts = load_attempts(&transaction, &task_ids)?;
+        let events = load_events(&transaction, run_id)?;
+        transaction.commit().map_err(database_error)?;
         Ok(RunSnapshot {
             run,
             items,
@@ -643,18 +664,80 @@ impl WorkflowStore {
 
     pub fn list_runs(&self) -> Result<Vec<RunSummary>, String> {
         let connection = self.connection()?;
-        let ids: Vec<String> = {
+        let raw = {
             let mut statement = connection
-                .prepare("SELECT id FROM runs ORDER BY updated_at DESC, created_at DESC")
+                .prepare(
+                    "SELECT
+                        r.id,
+                        r.template_json,
+                        r.state,
+                        r.revision,
+                        r.updated_at,
+                        COUNT(DISTINCT i.id),
+                        COALESCE(SUM(CASE WHEN t.state = 'pending' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN t.state = 'ready' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN t.state = 'dispatching' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN t.state = 'running' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN t.state = 'succeeded' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN t.state = 'failed' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN t.state = 'attention' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN t.state = 'skipped' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN t.state = 'cancelled' THEN 1 ELSE 0 END), 0)
+                     FROM runs r
+                     LEFT JOIN items i ON i.run_id = r.id
+                     LEFT JOIN tasks t ON t.run_id = r.id AND t.item_id = i.id
+                     GROUP BY r.id
+                     ORDER BY r.updated_at DESC, r.created_at DESC",
+                )
                 .map_err(database_error)?;
             let rows = statement
-                .query_map([], |row| row.get(0))
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, i64>(14)?,
+                    ))
+                })
                 .map_err(database_error)?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(database_error)?
         };
-        ids.into_iter()
-            .map(|id| self.get_run(&id).map(snapshot_summary))
+        raw.into_iter()
+            .map(|raw| {
+                let template: RunTemplate = decode_json(&raw.1, "stored run template")?;
+                validate_template(&template)?;
+                Ok(RunSummary {
+                    id: raw.0,
+                    name: template.name,
+                    state: RunState::parse(&raw.2)?,
+                    revision: as_u64(raw.3, "run revision")?,
+                    item_count: as_u32(raw.5, "run item count")?,
+                    task_counts: TaskCounts {
+                        pending: as_u32(raw.6, "pending task count")?,
+                        ready: as_u32(raw.7, "ready task count")?,
+                        dispatching: as_u32(raw.8, "dispatching task count")?,
+                        running: as_u32(raw.9, "running task count")?,
+                        succeeded: as_u32(raw.10, "succeeded task count")?,
+                        failed: as_u32(raw.11, "failed task count")?,
+                        attention: as_u32(raw.12, "attention task count")?,
+                        skipped: as_u32(raw.13, "skipped task count")?,
+                        cancelled: as_u32(raw.14, "cancelled task count")?,
+                    },
+                    updated_at: as_u64(raw.4, "run update time")?,
+                })
+            })
             .collect()
     }
 
@@ -672,7 +755,7 @@ impl WorkflowStore {
             .execute_batch(
                 "PRAGMA foreign_keys = ON;
                  PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = NORMAL;
+                 PRAGMA synchronous = FULL;
                  PRAGMA wal_autocheckpoint = 100;
                  PRAGMA journal_size_limit = 4194304;",
             )
@@ -695,6 +778,7 @@ impl WorkflowStore {
         }
         migrate(&mut connection)?;
         ensure_private_file(&self.path)?;
+        ensure_private_sqlite_sidecars(&self.path)?;
         Ok(connection)
     }
 }
@@ -803,6 +887,126 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(database_error)?;
     transaction.commit().map_err(database_error)
+}
+
+fn active_attempt_count(transaction: &Transaction<'_>) -> Result<i64, String> {
+    let (active_attempts, consistent_attempts): (i64, i64) = transaction
+        .query_row(
+            "SELECT COUNT(a.id), COUNT(t.id)
+             FROM attempts a
+             LEFT JOIN tasks t
+               ON t.id = a.task_id
+              AND t.current_attempt_id = a.id
+              AND t.state IN ('dispatching', 'running')
+             WHERE a.state IN ('dispatching', 'running')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(database_error)?;
+    if active_attempts != consistent_attempts {
+        return Err(
+            "Workflow storage has an active attempt/task invariant violation; it requires explicit recovery"
+                .to_string(),
+        );
+    }
+    Ok(active_attempts)
+}
+
+fn report_is_already_accepted(
+    transaction: &Transaction<'_>,
+    attempt_id: &str,
+    worker_id: &str,
+    report: &AttemptReport,
+) -> Result<bool, String> {
+    let raw: Option<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = transaction
+        .query_row(
+            "SELECT
+                    a.state,
+                    a.worker_id,
+                    t.state,
+                    t.current_attempt_id,
+                    t.output_json,
+                    t.failure_reason
+                 FROM attempts a
+                 JOIN tasks t ON t.id = a.task_id
+                 WHERE a.id = ?1",
+            params![attempt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error)?;
+    let Some((
+        attempt_state,
+        actual_worker,
+        task_state,
+        current_attempt_id,
+        stored_task_output,
+        failure,
+    )) = raw
+    else {
+        return Ok(false);
+    };
+    if actual_worker != worker_id {
+        return Err("Workflow attempt does not belong to this worker".to_string());
+    }
+    if current_attempt_id.as_deref() != Some(attempt_id) {
+        return Ok(false);
+    }
+
+    match (
+        AttemptState::parse(&attempt_state)?,
+        TaskState::parse(&task_state)?,
+        report,
+    ) {
+        (
+            AttemptState::Succeeded,
+            TaskState::Succeeded,
+            AttemptReport::Succeeded {
+                output: report_output,
+            },
+        ) => {
+            let stored_output = stored_task_output.ok_or_else(|| {
+                "Workflow succeeded attempt is missing its accepted task output".to_string()
+            })?;
+            let stored_output: Value = decode_json(&stored_output, "stored task output")?;
+            if &stored_output == report_output {
+                Ok(true)
+            } else {
+                Err("Workflow report conflicts with the already accepted result".to_string())
+            }
+        }
+        (AttemptState::Failed, TaskState::Attention, AttemptReport::Failed { summary }) => {
+            if failure.as_deref() == Some(summary.as_str()) {
+                Ok(true)
+            } else {
+                Err("Workflow report conflicts with the already accepted failure".to_string())
+            }
+        }
+        (AttemptState::Succeeded, TaskState::Succeeded, _)
+        | (AttemptState::Failed, TaskState::Attention, _) => {
+            Err("Workflow report conflicts with the already accepted terminal result".to_string())
+        }
+        (AttemptState::Succeeded | AttemptState::Failed, _, _) => {
+            Err("Workflow terminal attempt and task state are inconsistent".to_string())
+        }
+        _ => Ok(false),
+    }
 }
 
 fn live_attempt_context(
@@ -926,6 +1130,77 @@ fn stage_for_task(
         .ok_or_else(|| format!("Stored workflow task references missing stage {stage_index}"))
 }
 
+fn load_prior_outputs(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    item_id: &str,
+    stage_index: i64,
+) -> Result<Vec<AcceptedStageOutput>, String> {
+    if stage_index < 0 {
+        return Err("Stored workflow task has a negative stage index".to_string());
+    }
+    if stage_index == 0 {
+        return Ok(Vec::new());
+    }
+    let raw = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT stage_id, stage_index, state, output_json
+                 FROM tasks
+                 WHERE run_id = ?1 AND item_id = ?2 AND stage_index < ?3
+                 ORDER BY stage_index ASC",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map(params![run_id, item_id, stage_index], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(database_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?
+    };
+    let expected_count = usize::try_from(stage_index)
+        .map_err(|_| "Stored workflow task has an invalid stage index".to_string())?;
+    if raw.len() != expected_count {
+        return Err(
+            "Workflow task cannot start because its prior stage set is incomplete".to_string(),
+        );
+    }
+
+    raw.into_iter()
+        .enumerate()
+        .map(
+            |(expected_index, (stage_id, actual_index, state, output_json))| {
+                if actual_index != expected_index as i64 {
+                    return Err(
+                        "Workflow task has a non-contiguous prior stage sequence".to_string()
+                    );
+                }
+                if TaskState::parse(&state)? != TaskState::Succeeded {
+                    return Err(
+                        "Workflow task cannot start before every prior stage succeeds".to_string(),
+                    );
+                }
+                let output_json = output_json.ok_or_else(|| {
+                    "Workflow task has a succeeded prior stage without accepted output".to_string()
+                })?;
+                let output: Value = decode_json(&output_json, "stored prior stage output")?;
+                validate_json_value(&output, "Stored prior stage output", MAX_OUTPUT_BYTES)?;
+                Ok(AcceptedStageOutput {
+                    stage_id,
+                    stage_index: as_u32(actual_index, "prior stage index")?,
+                    output,
+                })
+            },
+        )
+        .collect()
+}
+
 fn derive_run_state_from_store(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -983,10 +1258,49 @@ fn append_event(
         )
         .map_err(database_error)?;
     if current_count >= MAX_EVENTS_PER_RUN {
-        return Err(format!(
-            "Workflow run reached its {MAX_EVENTS_PER_RUN} event retention limit"
-        ));
+        // Event-count retention must not prevent a lifecycle transition from
+        // committing. Record the compaction, then make room for the incoming
+        // event in the same transaction.
+        let remove_count = EVENT_COMPACTION_BATCH.max(current_count - MAX_EVENTS_PER_RUN + 2);
+        let removed = transaction
+            .execute(
+                "DELETE FROM events
+                 WHERE sequence IN (
+                    SELECT sequence
+                    FROM events
+                    WHERE run_id = ?1
+                    ORDER BY sequence ASC
+                    LIMIT ?2
+                 )",
+                params![run_id, remove_count],
+            )
+            .map_err(database_error)?;
+        if removed == 0 {
+            return Err("Workflow event retention could not make room for a new event".to_string());
+        }
+        insert_event(
+            transaction,
+            run_id,
+            None,
+            None,
+            "events_compacted",
+            &json!({"dropped_event_count": removed}),
+            now,
+        )?;
     }
+
+    insert_event(transaction, run_id, task_id, attempt_id, kind, payload, now)
+}
+
+fn insert_event(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    task_id: Option<&str>,
+    attempt_id: Option<&str>,
+    kind: &str,
+    payload: &Value,
+    now: u64,
+) -> Result<(), String> {
     let payload_json = encode_json(payload, "workflow event payload", MAX_EVENT_PAYLOAD_BYTES)?;
     transaction
         .execute(
@@ -1215,32 +1529,6 @@ fn load_events(connection: &Connection, run_id: &str) -> Result<Vec<WorkflowEven
         .collect()
 }
 
-fn snapshot_summary(snapshot: RunSnapshot) -> RunSummary {
-    let mut task_counts = TaskCounts::default();
-    for task in &snapshot.tasks {
-        match task.state {
-            TaskState::Pending => task_counts.pending += 1,
-            TaskState::Ready => task_counts.ready += 1,
-            TaskState::Dispatching => task_counts.dispatching += 1,
-            TaskState::Running => task_counts.running += 1,
-            TaskState::Succeeded => task_counts.succeeded += 1,
-            TaskState::Failed => task_counts.failed += 1,
-            TaskState::Attention => task_counts.attention += 1,
-            TaskState::Skipped => task_counts.skipped += 1,
-            TaskState::Cancelled => task_counts.cancelled += 1,
-        }
-    }
-    RunSummary {
-        id: snapshot.run.id,
-        name: snapshot.run.template.name,
-        state: snapshot.run.state,
-        revision: snapshot.run.revision,
-        item_count: snapshot.items.len() as u32,
-        task_counts,
-        updated_at: snapshot.run.updated_at,
-    }
-}
-
 fn encode_json<T: serde::Serialize>(
     value: &T,
     label: &str,
@@ -1321,6 +1609,21 @@ fn ensure_private_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_private_sqlite_sidecars(path: &Path) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "Workflow database path has no file name".to_string())?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_name = file_name.to_os_string();
+        sidecar_name.push(suffix);
+        let sidecar_path = path.with_file_name(sidecar_name);
+        if sidecar_path.exists() {
+            ensure_private_file(&sidecar_path)?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_run_output_budget(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -1377,6 +1680,23 @@ mod tests {
     }
 
     #[test]
+    fn list_runs_counts_each_multi_item_task_once() {
+        let (store, root) = test_store();
+        let run = store
+            .create_run(fixture_template(), fixture_items())
+            .unwrap();
+        let summaries = store.list_runs().unwrap();
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.id, run.run.id);
+        assert_eq!(summary.item_count, 2);
+        assert_eq!(summary.task_counts.ready, 2);
+        assert_eq!(summary.task_counts.pending, 2);
+        assert_eq!(summary.task_counts.dispatching, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn successful_report_advances_only_the_same_item() {
         let (store, root) = test_store();
         let run = store
@@ -1416,6 +1736,79 @@ mod tests {
             .find(|task| task.item_id == claim.item_id && task.stage_index == 1)
             .unwrap();
         assert_eq!(advanced.state, TaskState::Ready);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successor_claim_receives_only_accepted_outputs_from_its_item() {
+        let (store, root) = test_store();
+        store
+            .create_run(fixture_template(), fixture_items())
+            .unwrap();
+        let first = store.claim_next_ready_task("worker-1").unwrap().unwrap();
+        assert!(first.prior_outputs.is_empty());
+        store
+            .mark_attempt_running(&first.attempt_id, "worker-1")
+            .unwrap();
+        store
+            .submit_report(
+                &first.attempt_id,
+                "worker-1",
+                AttemptReport::Succeeded {
+                    output: json!({"notes": ["accepted"]}),
+                },
+            )
+            .unwrap();
+
+        let successor = store.claim_next_ready_task("worker-2").unwrap().unwrap();
+        assert_eq!(successor.item_id, first.item_id);
+        assert_eq!(successor.stage.id, "review");
+        assert_eq!(
+            successor.prior_outputs,
+            vec![AcceptedStageOutput {
+                stage_id: "collect".to_string(),
+                stage_index: 0,
+                output: json!({"notes": ["accepted"]}),
+            }]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identical_terminal_report_is_idempotent_without_a_second_event() {
+        let (store, root) = test_store();
+        let run = store
+            .create_run(fixture_template(), fixture_items())
+            .unwrap();
+        let claim = store.claim_next_ready_task("worker-1").unwrap().unwrap();
+        store
+            .mark_attempt_running(&claim.attempt_id, "worker-1")
+            .unwrap();
+        let report = AttemptReport::Succeeded {
+            output: json!({"notes": ["accepted"]}),
+        };
+        store
+            .submit_report(&claim.attempt_id, "worker-1", report.clone())
+            .unwrap();
+        let event_count = store.get_run(&run.run.id).unwrap().events.len();
+
+        store
+            .submit_report(&claim.attempt_id, "worker-1", report)
+            .unwrap();
+        assert_eq!(
+            store.get_run(&run.run.id).unwrap().events.len(),
+            event_count
+        );
+        assert!(store
+            .submit_report(
+                &claim.attempt_id,
+                "worker-1",
+                AttemptReport::Succeeded {
+                    output: json!({"notes": ["different"]}),
+                },
+            )
+            .unwrap_err()
+            .contains("conflicts"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1466,6 +1859,38 @@ mod tests {
             .mark_attempt_interrupted(&first.attempt_id, "worker-1", "Worker stopped")
             .unwrap();
         assert!(store.claim_next_ready_task("worker-2").unwrap().is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claim_reports_a_dangling_active_attempt_instead_of_silently_deadlocking() {
+        let (store, root) = test_store();
+        store
+            .create_run(fixture_template(), fixture_items())
+            .unwrap();
+        let first = store.claim_next_ready_task("worker-1").unwrap().unwrap();
+        store
+            .mark_attempt_interrupted(&first.attempt_id, "worker-1", "Worker exited")
+            .unwrap();
+        store.retry_task(&first.task_id, &first.attempt_id).unwrap();
+        let replacement = store.claim_next_ready_task("worker-2").unwrap().unwrap();
+        store
+            .mark_attempt_interrupted(&replacement.attempt_id, "worker-2", "Worker exited")
+            .unwrap();
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE attempts SET state = 'running' WHERE id = ?1",
+                    params![first.attempt_id],
+                )
+                .unwrap();
+        }
+
+        assert!(store
+            .claim_next_ready_task("worker-3")
+            .unwrap_err()
+            .contains("invariant violation"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1595,6 +2020,64 @@ mod tests {
                 },
             )
             .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn event_count_retention_does_not_block_a_lifecycle_transition() {
+        let (store, root) = test_store();
+        let run = store
+            .create_run(fixture_template(), fixture_items())
+            .unwrap();
+        let claim = store.claim_next_ready_task("worker-1").unwrap().unwrap();
+        {
+            let mut connection = store.connection().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction
+                .execute("DELETE FROM events WHERE run_id = ?1", params![run.run.id])
+                .unwrap();
+            for _ in 0..MAX_EVENTS_PER_RUN {
+                transaction
+                    .execute(
+                        "INSERT INTO events (run_id, task_id, attempt_id, kind, payload_json, created_at)
+                         VALUES (?1, NULL, NULL, 'seed', '{}', 0)",
+                        params![run.run.id],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+
+        store
+            .mark_attempt_running(&claim.attempt_id, "worker-1")
+            .unwrap();
+        let connection = store.connection().unwrap();
+        let event_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE run_id = ?1",
+                params![run.run.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let compaction_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND kind = 'events_compacted'",
+                params![run.run.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let task_state: String = connection
+            .query_row(
+                "SELECT state FROM tasks WHERE id = ?1",
+                params![claim.task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(event_count <= MAX_EVENTS_PER_RUN);
+        assert_eq!(compaction_count, 1);
+        assert_eq!(task_state, TaskState::Running.as_str());
         let _ = fs::remove_dir_all(root);
     }
 

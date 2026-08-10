@@ -64,7 +64,8 @@ pub const fn attempt_transition_allowed(from: AttemptState, to: AttemptState) ->
 
 pub fn derive_run_state(tasks: impl IntoIterator<Item = TaskState>, paused: bool) -> RunState {
     let mut saw_task = false;
-    let mut has_work = false;
+    let mut has_dispatchable_or_active_work = false;
+    let mut has_blocked_work = false;
     let mut has_attention = false;
     let mut has_failed = false;
     let mut has_cancelled = false;
@@ -72,8 +73,9 @@ pub fn derive_run_state(tasks: impl IntoIterator<Item = TaskState>, paused: bool
     for task in tasks {
         saw_task = true;
         match task {
-            TaskState::Pending | TaskState::Ready | TaskState::Dispatching | TaskState::Running => {
-                has_work = true
+            TaskState::Pending => has_blocked_work = true,
+            TaskState::Ready | TaskState::Dispatching | TaskState::Running => {
+                has_dispatchable_or_active_work = true
             }
             TaskState::Attention => has_attention = true,
             TaskState::Failed => has_failed = true,
@@ -85,13 +87,13 @@ pub fn derive_run_state(tasks: impl IntoIterator<Item = TaskState>, paused: bool
     if !saw_task {
         return RunState::Failed;
     }
-    if paused && has_work {
+    if paused && (has_dispatchable_or_active_work || has_blocked_work) {
         return RunState::Paused;
     }
-    if has_work {
+    if has_dispatchable_or_active_work {
         return RunState::Running;
     }
-    if has_attention {
+    if has_attention || has_blocked_work {
         return RunState::Attention;
     }
     if has_failed {
@@ -132,6 +134,14 @@ mod tests {
         );
         assert_eq!(
             derive_run_state([TaskState::Attention, TaskState::Succeeded], false),
+            RunState::Attention
+        );
+    }
+
+    #[test]
+    fn blocked_successor_does_not_hide_attention() {
+        assert_eq!(
+            derive_run_state([TaskState::Attention, TaskState::Pending], false),
             RunState::Attention
         );
     }
