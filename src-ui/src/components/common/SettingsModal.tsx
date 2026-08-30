@@ -12,7 +12,7 @@
 // Dispatch + persistence mirror the former Explorer wiring exactly so behaviour
 // is unchanged; only the presentation moved.
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react';
 import { useAppState, useAppDispatch, HOTKEY_SCHEMES, type HotkeyScheme, type TitlebarToggleDisplay, type ThemeColor, type ThemeShape, type IconTheme } from '../../store/app-state';
 import { playNotifySound } from '../../lib/notify-sound';
 import { useT } from '../../i18n/useT';
@@ -25,7 +25,9 @@ import { McpSettings } from '../../features/mcp/McpSettings';
 import { THEME_COLORS, THEME_SHAPES, ICON_ART_THEMES, LANGUAGES, TASK_VIEW_MODES, isMaskTintTheme } from '../../lib/personalization';
 import './SettingsModal.css';
 
-type Section = 'appearance' | 'wallpaper' | 'terminal' | 'mcp' | 'gambit' | 'sound' | 'tasks' | 'language' | 'feedback';
+const SkillsSettings = lazy(() => import('../../features/skills/SkillsSettings').then(module => ({ default: module.SkillsSettings })));
+
+type Section = 'appearance' | 'wallpaper' | 'terminal' | 'mcp' | 'skills' | 'gambit' | 'sound' | 'tasks' | 'language' | 'feedback';
 
 // Trailing "opens outside the app" affordance on the feedback cards.
 const ExternalLinkArrow = () => (
@@ -86,6 +88,12 @@ const ICONS: Record<Section, ReactNode> = {
   mcp: (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="M7 8a4 4 0 1 1 4-4v16a4 4 0 1 1-4-4h10a4 4 0 1 1-4 4V4a4 4 0 1 1 4 4H7Z" />
+    </svg>
+  ),
+  skills: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 4.75A2.75 2.75 0 0 1 6.75 2H20v16.5H6.75A2.75 2.75 0 0 0 4 21.25V4.75Z" />
+      <path d="M4 18.5A2.75 2.75 0 0 1 6.75 15.75H20" /><path d="M9 6.5h7M9 10h5" />
     </svg>
   ),
   gambit: (
@@ -260,6 +268,7 @@ export function SettingsModal() {
     { id: 'wallpaper',  label: t('settings.wallpaper' as any) },
     { id: 'terminal',   label: t('settings.terminal' as any) },
     { id: 'mcp',        label: t('settings.mcp' as any) },
+    { id: 'skills',     label: t('settings.skills' as any) },
     { id: 'gambit',     label: t('settings.gambit' as any) },
     { id: 'sound',      label: t('settings.sound' as any) },
     { id: 'tasks',      label: t('settings.tasks' as any) },
@@ -650,6 +659,8 @@ export function SettingsModal() {
             )}
 
             {section === 'mcp' && <McpSettings />}
+
+            {section === 'skills' && <Suspense fallback={<div className="skills-empty">{t('skills.loading' as any)}</div>}><SkillsSettings /></Suspense>}
 
             {section === 'language' && (
               <div className="settings-lang-list">

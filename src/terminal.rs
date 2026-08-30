@@ -7,7 +7,7 @@
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
@@ -430,6 +430,144 @@ pub fn find_preset(tool_name: &str) -> Option<&'static AgentPreset> {
 
 // ─── Shared Session State ─────────────────────────────────
 
+const PROCESS_STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(1200);
+
+#[derive(Debug, Clone)]
+pub struct TerminalStopReport {
+    pub root_pid: Option<u32>,
+    pub targeted: usize,
+    pub forced: usize,
+    pub remaining: Vec<u32>,
+}
+
+impl TerminalStopReport {
+    pub fn verified(&self) -> bool {
+        self.remaining.is_empty()
+    }
+}
+
+enum TerminalProcessState {
+    Running,
+    Stopping,
+    Stopped(TerminalStopReport),
+}
+
+/// Owns the exact OS process identity for one PTY generation. Multiple stop
+/// paths (tab close, renderer replacement, app exit, child watcher) can race;
+/// only the first performs termination and the others wait for its report.
+pub struct TerminalProcessControl {
+    root_pid: Option<u32>,
+    #[cfg(unix)]
+    tree: Option<crate::process_lifecycle::ManagedProcessTree>,
+    fallback_killer: Mutex<Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    state: Mutex<TerminalProcessState>,
+    stopped: Condvar,
+}
+
+impl TerminalProcessControl {
+    fn new(
+        root_pid: Option<u32>,
+        fallback_killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    ) -> Self {
+        Self {
+            root_pid,
+            #[cfg(unix)]
+            tree: root_pid.and_then(crate::process_lifecycle::ManagedProcessTree::capture),
+            fallback_killer: Mutex::new(Some(fallback_killer)),
+            state: Mutex::new(TerminalProcessState::Running),
+            stopped: Condvar::new(),
+        }
+    }
+
+    pub fn stop_blocking(&self) -> TerminalStopReport {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            loop {
+                match &*state {
+                    TerminalProcessState::Stopped(report) => return report.clone(),
+                    TerminalProcessState::Stopping => {
+                        state = self
+                            .stopped
+                            .wait(state)
+                            .unwrap_or_else(|error| error.into_inner());
+                    }
+                    TerminalProcessState::Running => {
+                        *state = TerminalProcessState::Stopping;
+                        break;
+                    }
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        let report = self
+            .tree
+            .as_ref()
+            .map(|tree| {
+                let report = tree.terminate(PROCESS_STOP_GRACE);
+                TerminalStopReport {
+                    root_pid: Some(report.root_pid),
+                    targeted: report.targeted,
+                    forced: report.forced,
+                    remaining: report.remaining,
+                }
+            })
+            .unwrap_or_else(|| self.kill_direct_child());
+
+        #[cfg(not(unix))]
+        let report = self.kill_direct_child();
+
+        // A direct child killer remains a last-resort fallback when native
+        // process discovery was unavailable or could not verify the root.
+        if !report.verified() {
+            // `kill()` returning Ok only confirms signal delivery. Preserve
+            // the native report instead of falsely claiming the PID exited.
+            let _ = self.kill_direct_child();
+        }
+
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        *state = TerminalProcessState::Stopped(report.clone());
+        self.stopped.notify_all();
+        report
+    }
+
+    fn kill_direct_child(&self) -> TerminalStopReport {
+        let killed = self
+            .fallback_killer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+            .is_none_or(|killer| killer.kill().is_ok());
+        TerminalStopReport {
+            root_pid: self.root_pid,
+            targeted: usize::from(self.root_pid.is_some()),
+            forced: usize::from(self.root_pid.is_some()),
+            remaining: if killed {
+                Vec::new()
+            } else {
+                self.root_pid.into_iter().collect()
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn completed_for_test() -> Arc<Self> {
+        Arc::new(Self {
+            root_pid: None,
+            #[cfg(unix)]
+            tree: None,
+            fallback_killer: Mutex::new(None),
+            state: Mutex::new(TerminalProcessState::Stopped(TerminalStopReport {
+                root_pid: None,
+                targeted: 0,
+                forced: 0,
+                remaining: Vec::new(),
+            })),
+            stopped: Condvar::new(),
+        })
+    }
+}
+
 pub struct TerminalSession {
     /// Unique launch generation for this logical terminal id. A restarted
     /// pane gets a new value so delayed events and cleanup from the old PTY
@@ -447,6 +585,7 @@ pub struct TerminalSession {
     /// lock before doing PTY I/O, preventing multi-tab starvation.
     pub writer_lock: Arc<Mutex<Box<dyn Write + Send>>>,
     pub kill_tx: std::sync::mpsc::Sender<()>,
+    pub process_control: Arc<TerminalProcessControl>,
     /// The tool name (e.g. "claude", "qwen") for this session
     #[allow(dead_code)]
     pub tool_name: Option<String>,
@@ -1101,6 +1240,11 @@ pub fn spawn(
     let mut child = pair.slave.spawn_command(cmd)?;
     eprintln!("[Tier Terminal] PTY process spawned OK (portable-pty)");
 
+    let process_control = Arc::new(TerminalProcessControl::new(
+        child.process_id(),
+        child.clone_killer(),
+    ));
+
     // Bind the new child to the kill-on-close Job Object so it can't outlive
     // Coffee CLI's process. Belt-and-suspenders with the ExitRequested
     // handler in server.rs: the handler does graceful kill_tx on clean
@@ -1129,12 +1273,24 @@ pub fn spawn(
 
     let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
 
-    // ── Kill thread: drop PTY master on signal → reader gets EOF → cleanup runs
+    // ── Kill thread: terminate the verified process tree, then release PTY ──
     let master_for_kill = master_arc.clone();
+    let process_for_kill = process_control.clone();
     std::thread::spawn(move || {
         let _ = kill_rx.recv(); // block until kill_tx.send(()) or sender dropped
+        let report = process_for_kill.stop_blocking();
+        eprintln!(
+            "[Tier Terminal] process cleanup root={:?}, targeted={}, forced={}",
+            report.root_pid, report.targeted, report.forced
+        );
+        if !report.verified() {
+            eprintln!(
+                "[Tier Terminal] process cleanup incomplete for {:?}: remaining {:?}",
+                report.root_pid, report.remaining
+            );
+        }
         if let Ok(mut guard) = master_for_kill.lock() {
-            *guard = None; // drop PTY master → pipe closes
+            *guard = None;
         }
     });
 
@@ -1164,7 +1320,8 @@ pub fn spawn(
             .map_err(|error| anyhow::anyhow!("Launch registry lock poisoned: {error}"))?
             .is_current(&session_id, &run_id);
         if !launch_is_current {
-            let _ = child.kill();
+            let _ = process_control.stop_blocking();
+            let _ = child.wait();
             return Ok(false);
         }
         let writer_clone = writer.clone();
@@ -1182,6 +1339,7 @@ pub fn spawn(
                 run_is_live,
                 writer_lock: writer_clone,
                 kill_tx,
+                process_control: process_control.clone(),
                 tool_name: tool_name.clone(),
                 session_token: Mutex::new(None),
                 _master: master_clone,
@@ -1195,7 +1353,8 @@ pub fn spawn(
     let replaced_session = match replaced_session {
         SessionInstallOutcome::Installed(previous) => previous,
         SessionInstallOutcome::Cancelled => {
-            let _ = child.kill();
+            let _ = process_control.stop_blocking();
+            let _ = child.wait();
             return Ok(false);
         }
     };
@@ -1214,6 +1373,7 @@ pub fn spawn(
     let app_for_watcher = app.clone();
     let sid_for_watcher = session_id.clone();
     let run_id_for_watcher = run_id.clone();
+    let process_for_watcher = process_control.clone();
     std::thread::spawn(move || {
         let exit_code = match child.wait() {
             Ok(status) => {
@@ -1226,6 +1386,16 @@ pub fn spawn(
                 -1
             }
         };
+        // A wrapper can exit while its Agent or stdio MCP descendants remain.
+        // Reuse the same idempotent controller so natural exit also settles
+        // every process that still belongs to this PTY generation.
+        let report = process_for_watcher.stop_blocking();
+        if !report.verified() {
+            eprintln!(
+                "[Tier Terminal] child exited but descendants remain for {:?}: {:?}",
+                report.root_pid, report.remaining
+            );
+        }
         let _ = app_for_watcher.emit(
             "tier-terminal-exit",
             TerminalExitEvent {
@@ -1574,6 +1744,7 @@ mod tests {
             run_is_live: Arc::new(AtomicBool::new(true)),
             writer_lock: Arc::new(Mutex::new(Box::new(std::io::sink()))),
             kill_tx,
+            process_control: TerminalProcessControl::completed_for_test(),
             tool_name: None,
             session_token: Mutex::new(None),
             _master: Arc::new(Mutex::new(None)),

@@ -1,6 +1,6 @@
 [package]
 name = "coffee-cli"
-version = "3.3.6"
+version = "3.3.7"
 edition = "2021"
 description = "Lightweight Multi-layer AI CLI Terminal"
 license = "AGPL-3.0-or-later"
@@ -63,6 +63,10 @@ notify = "6.1.1"
 notify-debouncer-full = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 keyring = "3"
+# Cross-process advisory locking for Coffee-owned configuration files. The
+# in-process Mutex in `server.rs` cannot protect a debug build and a released
+# app running at the same time.
+fs2 = "0.4"
 
 # Multi-agent MCP server (v1.0: 3 tools, HTTP Streamable transport)
 # See docs/MULTI-AGENT-ARCHITECTURE.md §5.5 for why HTTP over stdio.

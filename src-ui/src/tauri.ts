@@ -444,6 +444,17 @@ export const commands = {
   saveMcpConfig: (config: McpConfig) => invoke<McpConfig>('save_mcp_config', { config }),
   setMcpMultiAgentBinding: (workspace: string, pane: number, mutation: McpMultiAgentBindingMutation) =>
     invoke<McpConfig>('set_mcp_multi_agent_binding', { workspace, pane, mutation }),
+
+  // Coffee-managed native Skills. These commands only manage Coffee-owned
+  // source content and installations under documented Codex/Claude folders;
+  // they never rewrite either CLI's global configuration.
+  getSkillsOverview: () => invoke<SkillsOverview>('get_skills_overview'),
+  saveCoffeeSkill: (expectedRevision: number, skillId: string, skill: CoffeeSkill) =>
+    invoke<SkillsOverview>('save_coffee_skill', { expectedRevision, skillId, skill }),
+  deleteCoffeeSkill: (expectedRevision: number, skillId: string) =>
+    invoke<SkillsOverview>('delete_coffee_skill', { expectedRevision, skillId }),
+  setNativeSkillEnabled: (skillId: string, target: NativeSkillTarget, enabled: boolean) =>
+    invoke<SkillsOverview>('set_native_skill_enabled', { skillId, target, enabled }),
 };
 
 // In-app self-update progress, emitted by the Mechoy release downloader.
@@ -526,4 +537,37 @@ export interface McpConfig {
   };
   workspace_bindings: Array<{ workspace: string; profile: string }>;
   multi_agent_bindings: Array<{ workspace: string; panes: Record<string, string> }>;
+}
+
+export interface CoffeeSkill {
+  name: string;
+  description: string;
+  body: string;
+}
+
+export interface SkillsConfig {
+  version: number;
+  revision: number;
+  skills: Record<string, CoffeeSkill>;
+}
+
+export type NativeSkillTarget = 'codex' | 'claude';
+export type NativeSkillStatusKind =
+  | 'disabled'
+  | 'enabled_linked'
+  | 'enabled_copied'
+  | 'needs_sync'
+  | 'conflict'
+  | 'drift'
+  | 'source_missing'
+  | 'error';
+
+export interface NativeSkillStatus {
+  state: NativeSkillStatusKind;
+  detail?: string;
+}
+
+export interface SkillsOverview {
+  config: SkillsConfig;
+  statuses: Record<string, Record<NativeSkillTarget, NativeSkillStatus>>;
 }

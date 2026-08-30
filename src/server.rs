@@ -44,6 +44,11 @@ pub struct AppState {
     /// separate revision check rejects stale full-config saves instead of
     /// allowing a Settings tab to overwrite a newer pane binding.
     pub mcp_config_lock: Mutex<()>,
+    /// Serializes Coffee's own Skills JSON changes and explicit native Skill
+    /// installation/removal. Native files remain independently inspectable,
+    /// but two settings actions must never race over the same Coffee-owned
+    /// link or managed copy.
+    pub skills_config_lock: Mutex<()>,
     /// Serializes persistent multi-agent workspace snapshots. This is kept
     /// separate from mcp_config_lock so a history checkpoint never blocks a
     /// profile editor (and vice versa).
@@ -1780,7 +1785,7 @@ async fn stop_terminal_generation(
             .map_err(|error| format!("Launch registry lock poisoned: {error}"))?;
         launches.cancel(session_id, run_id);
     }
-    let kill_tx = {
+    let stop = {
         let map = state.terminal_session.lock().unwrap();
         map.get(session_id)
             .filter(|session| session.run_id == run_id)
@@ -1791,10 +1796,10 @@ async fn stop_terminal_generation(
                 session
                     .run_is_live
                     .store(false, std::sync::atomic::Ordering::Release);
-                session.kill_tx.clone()
+                (session.kill_tx.clone(), session.process_control.clone())
             })
     };
-    if kill_tx.is_some() {
+    if stop.is_some() {
         if let Some(event) = state
             .multi_agent_tasks
             .fail_target(session_id, run_id, task_failure_reason.to_string())
@@ -1802,11 +1807,31 @@ async fn stop_terminal_generation(
             let _ = app.emit("multi-agent-task-complete", event);
         }
     }
-    if let Some(kill_tx) = kill_tx {
+    let stop_error = if let Some((kill_tx, process_control)) = stop {
         let _ = kill_tx.send(());
-    }
+        let report = tokio::task::spawn_blocking(move || {
+            // Calling the idempotent controller here avoids relying on the
+            // signal worker being scheduled; whichever caller wins performs
+            // cleanup and the other waits on the same bounded result.
+            process_control.stop_blocking()
+        })
+        .await
+        .map_err(|error| format!("Terminal cleanup worker failed: {error}"))?;
+        eprintln!(
+            "[Tier Terminal] stop settled root={:?}, targeted={}, forced={}",
+            report.root_pid, report.targeted, report.forced
+        );
+        (!report.verified()).then(|| {
+            format!(
+                "Terminal process cleanup could not verify exit of PID(s): {:?}",
+                report.remaining
+            )
+        })
+    } else {
+        None
+    };
     cleanup_pane_mcp(state, session_id, run_id).await;
-    Ok(())
+    stop_error.map_or(Ok(()), Err)
 }
 
 #[tauri::command]
@@ -5090,6 +5115,116 @@ pub fn set_mcp_multi_agent_binding(
     crate::mcp_config::save(config)
 }
 
+// ─── Coffee-managed native Skills (~/.coffee-cli/skills.json) ─────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillsOverview {
+    pub config: crate::skills_config::SkillsConfig,
+    pub statuses: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, crate::native_skills::NativeSkillStatus>,
+    >,
+}
+
+fn skills_overview(config: crate::skills_config::SkillsConfig) -> SkillsOverview {
+    let statuses = crate::native_skills::inspect_all(&config);
+    SkillsOverview { config, statuses }
+}
+
+#[tauri::command]
+pub fn get_skills_overview() -> Result<SkillsOverview, String> {
+    Ok(skills_overview(crate::skills_config::load()?))
+}
+
+#[tauri::command]
+pub fn save_coffee_skill(
+    expected_revision: u64,
+    skill_id: String,
+    skill: crate::skills_config::CoffeeSkill,
+    state: State<'_, AppState>,
+) -> Result<SkillsOverview, String> {
+    let _guard = state
+        .skills_config_lock
+        .lock()
+        .map_err(|_| "Skills configuration lock was poisoned".to_string())?;
+    let _file_lock = crate::skills_config::acquire_write_lock()?;
+    let config = crate::skills_config::save_skill(expected_revision, skill_id, skill)?;
+    Ok(skills_overview(config))
+}
+
+#[tauri::command]
+pub fn delete_coffee_skill(
+    expected_revision: u64,
+    skill_id: String,
+    state: State<'_, AppState>,
+) -> Result<SkillsOverview, String> {
+    let _guard = state
+        .skills_config_lock
+        .lock()
+        .map_err(|_| "Skills configuration lock was poisoned".to_string())?;
+    let _file_lock = crate::skills_config::acquire_write_lock()?;
+    let current = crate::skills_config::load()?;
+    if current.revision != expected_revision {
+        return Err(
+            "Skills configuration changed in another Coffee window; reload it before saving"
+                .to_string(),
+        );
+    }
+    if !current.skills.contains_key(&skill_id) {
+        return Err(format!("Coffee Skill '{skill_id}' does not exist"));
+    }
+    // Deletion deliberately does not fan out into two native directories.
+    // Requiring the user to disable each owned target first makes every
+    // target operation independently visible and prevents a later target
+    // failure from leaving an invisible partial uninstall behind.
+    let statuses = crate::native_skills::inspect_all(&current);
+    let targets = statuses
+        .get(&skill_id)
+        .ok_or_else(|| format!("Could not inspect native targets for Coffee Skill '{skill_id}'"))?;
+    let blockers: Vec<String> = targets
+        .iter()
+        .filter_map(|(target, status)| {
+            if matches!(
+                status.state,
+                crate::native_skills::NativeSkillStatusKind::Disabled
+                    | crate::native_skills::NativeSkillStatusKind::Conflict
+            ) {
+                None
+            } else {
+                Some(format!("{target} ({:?})", status.state))
+            }
+        })
+        .collect();
+    if !blockers.is_empty() {
+        return Err(format!(
+            "Disable or resolve this Skill's Coffee-managed native targets before deleting it: {}. Coffee will not perform a partial multi-target uninstall.",
+            blockers.join(", ")
+        ));
+    }
+    let config = crate::skills_config::delete_skill(expected_revision, &skill_id)?;
+    Ok(skills_overview(config))
+}
+
+#[tauri::command]
+pub fn set_native_skill_enabled(
+    skill_id: String,
+    target: crate::native_skills::NativeSkillTarget,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<SkillsOverview, String> {
+    let _guard = state
+        .skills_config_lock
+        .lock()
+        .map_err(|_| "Skills configuration lock was poisoned".to_string())?;
+    let _file_lock = crate::skills_config::acquire_write_lock()?;
+    let config = crate::skills_config::load()?;
+    if !config.skills.contains_key(&skill_id) {
+        return Err(format!("Coffee Skill '{skill_id}' does not exist"));
+    }
+    crate::native_skills::set_enabled(&skill_id, target, enabled)?;
+    Ok(skills_overview(config))
+}
+
 // ─── Recoverable multi-agent workspaces ──────────────────────────────────────
 
 /// Register the WebView instance that owns coordinated panes. A Tauri process
@@ -5509,6 +5644,7 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
             ),
             mcp_spawn_lock: tokio::sync::Mutex::new(()),
             mcp_config_lock: Mutex::new(()),
+            skills_config_lock: Mutex::new(()),
             multi_agent_workspace_lock: Arc::new(Mutex::new(())),
             multi_agent_workspace_runtime: Arc::new(Mutex::new(
                 crate::multi_agent_workspace::WorkspaceRuntime::default(),
@@ -5571,6 +5707,10 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
             get_mcp_multi_agent_binding,
             save_mcp_config,
             set_mcp_multi_agent_binding,
+            get_skills_overview,
+            save_coffee_skill,
+            delete_coffee_skill,
+            set_native_skill_enabled,
             register_multi_agent_renderer,
             list_multi_agent_workspaces,
             checkpoint_multi_agent_workspace,
@@ -5667,20 +5807,16 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Issue #87: on macOS a reflexive Cmd+W / red traffic-light
-            // click should hide the main window to the Dock instead of
-            // quitting the app (standard Mac convention - Safari, VS Code,
-            // etc. all keep running). The app stays alive; clicking the
-            // Dock icon restores it via the Reopen event in `.run()` below.
-            // Cmd+Q still terminates normally because NSApplication
-            // terminate does not dispatch CloseRequested, so this prevent is
-            // never reached on a real quit. Only the main window hides -
-            // detached windows close normally.
+            // Coffee owns long-lived PTYs and MCP sidecars, so silently hiding
+            // the main window is not an acceptable close semantic: users can
+            // otherwise accumulate hundreds of invisible Codex/Java children.
+            // Route the native macOS traffic light and Cmd+W through the same
+            // ExitRequested cleanup used by Cmd+Q.
             #[cfg(target_os = "macos")]
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
-                    let _ = window.hide();
+                    window.app_handle().exit(0);
                 }
             }
             #[cfg(not(target_os = "macos"))]
@@ -5691,36 +5827,6 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
         .build(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("Error while building tauri application: {}", e))?
         .run(|app_handle, event| {
-            // ── Graceful PTY-child cleanup on app exit ─────────────────
-            // Issue #28: closing Coffee CLI without first killing tabs
-            // left orphan `claude.exe` / `node.exe` alive on Windows
-            // (they don't share a job with the parent by default), which
-            // held `~/.claude/` session locks and broke the NEXT launch's
-            // Claude Code tab.
-            //
-            // Two-layer fix:
-            //   1. Here (graceful path): on ExitRequested, drain every
-            //      session and fire kill_tx → drops PTY master → SIGHUP
-            //      flows down the pipe → child exits cleanly.
-            //   2. Job Object (crash-proof path, see terminal.rs): every
-            //      child is bound to a kill-on-close job so even a hard
-            //      crash / force-quit takes them with us.
-            // ── macOS: restore the hidden main window on Dock click ──────
-            // Pairs with the CloseRequested handler in `.on_window_event`:
-            // Cmd+W hides the main window rather than quitting, so on
-            // applicationShouldHandleReopen (Dock icon click) we must bring
-            // it back ourselves - macOS does not auto-unhide a hidden window
-            // on reopen. Issue #87.
-            #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = &event {
-                use tauri::Manager;
-                if let Some(w) = app_handle.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.unminimize();
-                    let _ = w.set_focus();
-                }
-            }
-
             if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
                 let state = app_handle.state::<AppState>();
                 // A restore can have reserved a launch before portable-pty has
@@ -5742,21 +5848,50 @@ pub fn start_ui(pending_launch: Option<crate::launch::LaunchRequest>) -> anyhow:
                         launches.cancel(&session_id, &run_id);
                     }
                 }
-                let mut n = 0usize;
-                if let Ok(mut map) = state.terminal_session.lock() {
-                    n = map.len();
+                let stops = if let Ok(mut map) = state.terminal_session.lock() {
+                    let mut stops = Vec::with_capacity(map.len());
                     for (_, session) in map.drain() {
                         session
                             .run_is_live
                             .store(false, std::sync::atomic::Ordering::Release);
-                        let _ = session.kill_tx.send(());
+                        stops.push((session.kill_tx, session.process_control));
                     }
-                }
-                if n > 0 {
+                    stops
+                } else {
+                    Vec::new()
+                };
+                if !stops.is_empty() {
+                    let n = stops.len();
+                    // Send every stop request before waiting so the shutdown
+                    // bound is one grace interval, not N intervals.
+                    let process_controls: Vec<_> = stops
+                        .into_iter()
+                        .map(|(kill_tx, process_control)| {
+                            let _ = kill_tx.send(());
+                            process_control
+                        })
+                        .collect();
+                    let mut incomplete = Vec::new();
+                    // Every session's existing kill worker is already active
+                    // before result collection starts. Calling the idempotent
+                    // controller directly also covers a failed channel send,
+                    // without creating one extra OS thread per open session.
+                    for process_control in process_controls {
+                        let report = process_control.stop_blocking();
+                        if !report.verified() {
+                            incomplete.extend(report.remaining);
+                        }
+                    }
                     eprintln!(
-                        "[Tier Terminal] App exiting — sent kill_tx to {} session(s)",
+                        "[Tier Terminal] App exiting — settled {} managed session(s)",
                         n
                     );
+                    if !incomplete.is_empty() {
+                        eprintln!(
+                            "[Tier Terminal] App exit could not verify PID(s): {:?}",
+                            incomplete
+                        );
+                    }
                 }
             }
         });

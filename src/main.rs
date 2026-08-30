@@ -9,12 +9,15 @@ mod launch;
 mod mcp_server;
 mod mcp_injector;
 mod mcp_config;
+mod native_skills;
 mod multi_agent_workspace;
 mod multi_agent_protocol;
+mod process_lifecycle;
 // Alpha domain foundation. It stays disconnected from the terminal runtime
 // until dedicated Workers and an authenticated Workflow MCP endpoint exist.
 #[allow(dead_code)]
 mod workflow;
+mod skills_config;
 mod tool_config;
 mod tools;
 mod git;
